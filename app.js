@@ -481,7 +481,7 @@ function step3(box){
       const normSku = s=>(s||'').replace(/@us$/i,'').trim();
       const bs = W.boxspecs.find(b=>normSku(b.sku)===normSku(it.sku)) || null;
       let declareSrc='manual', declareVal=it.declare;
-      if(declareVal===''||declareVal==null){ if(sk && sk.申报价){ declareVal=sk.申报价; declareSrc='sku'; } else if(it.cost!==''){ declareVal=(parseFloat(it.cost)*COEFF).toFixed(2); declareSrc='calc'; } }
+      if(declareVal===''||declareVal==null){ if(sk && sk.申报价){ declareVal=sk.申报价; declareSrc='sku'; } else if(window.SKU_DECLARE && window.SKU_DECLARE[it.sku]){ declareVal=window.SKU_DECLARE[it.sku].d; declareSrc='sku'; } else if(it.cost!==''){ declareVal=(parseFloat(it.cost)*COEFF).toFixed(2); declareSrc='calc'; } }
       let dcls, pill, pillTxt;
       if(declareSrc==='calc'){ dcls='cell-calc'; pill='pill-yellow'; pillTxt='推算(成本×'+COEFF+')'; }
       else if(declareSrc==='sku'){ dcls='cell-src'; pill='pill-green'; pillTxt='SKU主数据'; }
@@ -490,7 +490,7 @@ function step3(box){
       return `<tr>
         <td><input data-i="${i}" data-k="boxNo" value="${esc(it.boxNo)}" placeholder="箱号"></td>
         <td><input data-i="${i}" data-k="sku" value="${esc(it.sku)}" list="skuList" placeholder="SKU"></td>
-        <td><input data-i="${i}" data-k="nameCn" value="${esc(it.nameCn||(sk?sk.中文品名:''))}" placeholder="中文"></td>
+        <td><input data-i="${i}" data-k="nameCn" value="${esc(it.nameCn||(sk?sk.中文品名:'')||(window.SKU_DECLARE&&window.SKU_DECLARE[it.sku]?window.SKU_DECLARE[it.sku].n:''))}" placeholder="中文"></td>
         <td><input data-i="${i}" data-k="nameEn" value="${esc(it.nameEn||(sk?sk.英文品名:''))}" placeholder="英文"></td>
         <td><input data-i="${i}" data-k="qty" value="${esc(it.qty)}" style="width:54px" placeholder="数量"></td>
         <td class="${dcls}"><input data-i="${i}" data-k="declare" value="${esc(declareVal)}" style="width:74px"><br><span class="pill ${pill}">${pillTxt}</span></td>
@@ -580,8 +580,17 @@ function packingBannerHTML(){
 }
 function loadPackingList(fid){
   const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
-  if(pl.length){ W.form.items = pl.map(x=>Object.assign({}, x)); renderWizard(); }
-  else { const m=$('#pl_msg'); if(m) m.textContent='本地未收录该装箱清单，请上传 CSV。'; }
+  if(pl.length){
+    W.form.items = pl.map(x=>{
+      x = Object.assign({}, x);
+      if((!x.declare||x.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[x.sku]){
+        x.declare = window.SKU_DECLARE[x.sku].d;
+        if(!x.nameCn) x.nameCn = window.SKU_DECLARE[x.sku].n;
+      }
+      return x;
+    });
+    renderWizard();
+  } else { const m=$('#pl_msg'); if(m) m.textContent='本地未收录该装箱清单'; }
 }
 function parsePackingList(text){
   const lines=text.split(/\r?\n/).filter(l=>l.trim());
@@ -708,6 +717,11 @@ async function parsePackingXlsx(arrayBuffer){
     for(const it of out){
       const sk=(W.skus||[]).find(x=>x.sku===it.sku);
       if(sk){ it.nameCn = it.nameCn || sk.中文品名; it.nameEn = it.nameEn || sk.英文品名; it.hs = it.hs || sk.HS; it.material = it.material || sk.材质; it.declare = it.declare || sk.申报价; }
+      // 全量申报价索引兜底（14114 SKU，去前缀后快速 O(1) 查找）
+      if((!it.declare||it.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[it.sku]){
+        it.declare = window.SKU_DECLARE[it.sku].d;
+        if(!it.nameCn) it.nameCn = window.SKU_DECLARE[it.sku].n;
+      }
       const bs=(W.boxspecs||[]).find(x=>norm(x.sku)===norm(it.sku));
       if(bs){ it.boxSpec = it.boxSpec || bs.model; if(!it.boxWeight) it.boxWeight = bs.weight; if(!it.len) it.len = bs.l; if(!it.wid) it.wid = bs.w; if(!it.hgt) it.hgt = bs.h; }
     }
@@ -770,8 +784,8 @@ function runChecks(){
   W.form.items.forEach((it,i)=>{
     // 校验时反查 SKU 主数据（与 step3 渲染一致：原始空 → 用 sk.申报价/sk.中文品名）
     const sk = W.skus.find(s=>s.sku===it.sku);
-    const effDeclare = (it.declare!==''&&it.declare!=null) ? it.declare : (sk && sk.申报价 ? sk.申报价 : '');
-    const effNameCn = it.nameCn || (sk ? sk.中文品名 : '');
+    const effDeclare = (it.declare!==''&&it.declare!=null) ? it.declare : (sk && sk.申报价 ? sk.申报价 : (window.SKU_DECLARE && window.SKU_DECLARE[it.sku] ? window.SKU_DECLARE[it.sku].d : ''));
+    const effNameCn = it.nameCn || (sk ? sk.中文品名 : (window.SKU_DECLARE && window.SKU_DECLARE[it.sku] ? window.SKU_DECLARE[it.sku].n : ''));
     if(!it.boxNo||!effNameCn||!it.qty||!(effDeclare!==''&&effDeclare!=null)) itemErr++;
     qtySum+=parseFloat(it.qty)||0;
     decSum+=(parseFloat(effDeclare)||0)*(parseFloat(it.qty)||0);
