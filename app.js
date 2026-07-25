@@ -610,17 +610,102 @@ function parsePackingList(text){
   return out;
 }
 
-/* 在线获取：检查系统是否已预装该货件的装箱清单,有则秒填,无则提示用户上传或让 agent 拉取 */
+/* 在线获取：带 loading 进度条，先查缓存，后续扩展为后端代理 */
 function onlineFetch(fid){
   const msg=$('#pl_msg'); if(!msg) return;
+  const btn=$('#pl_online'); if(btn) btn.disabled=true;
+  const steps=[
+    {txt:'正在搜索货件号 <b>'+esc(fid)+'</b> 的装箱清单...'},
+    {txt:'正在读取系统预装数据...'},
+    {txt:'数据解析完成，正在填入表单...'}
+  ];
+  msg.innerHTML = '<div class="loading-wrap" id="loading_ui">'
+    +'<div class="loading-header"><div class="spinner"></div><div class="loading-title">正在处理，请稍候...</div></div>'
+    +'<div class="loading-bar-wrap"><div class="loading-bar" id="loading_bar"></div></div>'
+    +'<div class="loading-steps" id="loading_steps">'
+    +steps.map((s,i)=>'<div class="loading-step" data-i="'+i+'"><div class="dot"></div>'+s.txt+'</div>').join('')
+    +'</div></div>';
+
+  /* 阶段推进 */
+  function setStep(i,state){
+    const el=$('[data-i="'+i+'"]','#loading_steps');
+    if(el){ el.className='loading-step '+state; }
+  }
+  function setBar(pct){
+    const bar=$('#loading_bar');
+    if(bar) bar.style.width=pct+'%';
+  }
+  function done(ok,html){
+    const spinner=$('.spinner','#loading_ui');
+    const title=$('.loading-title','#loading_ui');
+    if(spinner) spinner.style.animation='none';
+    if(title){
+      title.innerHTML=ok ? '✅ 完成' : '⚠️ 未找到';
+      title.style.color=ok ? 'var(--green)' : 'var(--warn)';
+    }
+    const wrap=$('#loading_ui');
+    /* 2秒后替换成结果信息 */
+    setTimeout(()=>{
+      if(wrap) wrap.outerHTML=html;
+      if(btn) btn.disabled=false;
+    }, ok ? 800 : 2000);
+  }
+
+  /* 阶段1: 正在搜索（立即激活）*/
+  setStep(0,'active');
+  setBar(20);
+
+  setTimeout(()=>{
+    setStep(0,'done');
+    setStep(1,'active');
+    setBar(50);
+
+    setTimeout(()=>{
+      setStep(1,'done');
+
+      /* 实际查数据 */
+      const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
+      if(pl.length){
+        setStep(2,'active');
+        setBar(80);
+        setTimeout(()=>{
+          W.form.items = pl.map(x=>{
+            x = Object.assign({}, x);
+            if((!x.declare||x.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[x.sku]){
+              x.declare = window.SKU_DECLARE[x.sku].d;
+              if(!x.nameCn) x.nameCn = window.SKU_DECLARE[x.sku].n;
+            }
+            return x;
+          });
+          setStep(2,'done');
+          setBar(100);
+          renderWizard();
+          done(true,'<div class="hint ok" style="margin-top:10px">✅ 已从系统预装的装箱清单自动填入 <b>'+pl.length+'</b> 行（货件 '+esc(fid)+'）。请核对品名/数量/申报价。</div>');
+        },300);
+      } else {
+        /* 未预装的情况 */
+        setStep(2,'fail');
+        setBar(100);
+        done(false,'<div class="hint warn" style="margin-top:10px">⚠️ 货件号 <b>'+esc(fid)+'</b> 暂未预装。请二选一：<br>① 直接点「<b>📤 上传装箱清单</b>」选本机的 xlsx；<br>② 把云盘链接/货件号发我，我去拉取烘焙进系统。</div>');
+      }
+    }, 400);
+  }, 300);
+}
+
+/* 带 loading 的 loadPackingList（从搜索结果自动填入也用同样的流程） */
+function loadPackingList(fid){
   const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
   if(pl.length){
-    W.form.items = pl.map(x=>Object.assign({}, x));
-    msg.textContent='✅ 已从系统预装的装箱清单自动填入 '+pl.length+' 行（货件 '+fid+'）。';
+    W.form.items = pl.map(x=>{
+      x = Object.assign({}, x);
+      if((!x.declare||x.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[x.sku]){
+        x.declare = window.SKU_DECLARE[x.sku].d;
+        if(!x.nameCn) x.nameCn = window.SKU_DECLARE[x.sku].n;
+      }
+      return x;
+    });
     renderWizard();
-  } else {
-    msg.innerHTML = '⚠️ 货件号 <b>'+esc(fid)+'</b> 暂未预装。纯前端架构无法直连飞书云文档，请二选一：<br>① 直接点「📤 上传装箱清单」选本机的 xlsx；② 把云盘链接/货件号发我，<b>5 分钟内</b>我用 lark-cli 拉取并烘焙进系统（后续该货件点「在线获取」即可秒填）。';
-  }
+  } else { const m=$('#pl_msg'); if(m) m.textContent='本地未收录该装箱清单，请上传 CSV 或 Excel。'; }
 }
 
 /* 解析 Excel xlsx 装箱清单：用 ExcelJS 读，支持亚马逊 ONE_SKU 导出(格式A,按箱号/箱子名称区间展开)和通用按箱展开格式 */
