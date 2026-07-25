@@ -67,3 +67,15 @@ button.btn:disabled{opacity:.45;cursor:not-allowed}
 .flash{animation:flash 1s ease}
 @keyframes flash{0%{background:rgba(79,156,255,.3)}100%{background:transparent}}
 .empty{color:var(--muted);font-style:italic;padding:8px 0}
+.seg{display:flex;gap:8px;margin:12px 0}
+.seg-btn{background:var(--panel2);border:1px solid var(--line);color:var(--muted);padding:8px 14px;border-radius:8px;cursor:pointer;font-size:13px}
+.seg-btn.on{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+.rev-res{margin-top:10px;display:flex;flex-direction:column;gap:6px;max-height:280px;overflow:auto}
+.rev-item{border:1px solid var(--line);border-radius:8px;padding:8px 12px;cursor:pointer;background:var(--panel2);display:flex;flex-direction:column;gap:2px}
+.rev-item:hover{border-color:var(--accent)}
+.rev-item b{color:var(--txt)}
+.hint.ok{color:var(--green)}
+.hint.warn{color:var(--warn)}
+.kv{width:100%;border-collapse:collapse;font-size:13px;margin:8px 0}
+.kv td{border:1px solid var(--line);padding:6px 10px}
+.kv td:first-child{color:var(--muted);width:170px;background:var(--panel2)}
