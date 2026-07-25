@@ -683,10 +683,36 @@ function onlineFetch(fid){
           done(true,'<div class="hint ok" style="margin-top:10px">✅ 已从系统预装的装箱清单自动填入 <b>'+pl.length+'</b> 行（货件 '+esc(fid)+'）。请核对品名/数量/申报价。</div>');
         },300);
       } else {
-        /* 未预装的情况 */
-        setStep(2,'fail');
-        setBar(100);
-        done(false,'<div class="hint warn" style="margin-top:10px">⚠️ 货件号 <b>'+esc(fid)+'</b> 暂未预装。请二选一：<br>① 直接点「<b>📤 上传装箱清单</b>」选本机的 xlsx；<br>② 把云盘链接/货件号发我，我去拉取烘焙进系统。</div>');
+        /* 未预装 → 尝试调本地后端代理 */
+        setStep(1,'done');
+        setStep(2,'active');
+        setBar(60);
+        const backendUrl = localStorage.getItem('backend_url') || 'http://localhost:3456';
+        fetch(backendUrl+'/api/fetch-packing-list', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({fid})
+        }).then(r=>r.json()).then(data=>{
+          if(data.ok && data.items && data.items.length>0){
+            setStep(2,'done');
+            setBar(100);
+            W.form.items = data.items.map(x=>{
+              if((!x.declare||x.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[x.sku]){
+                x.declare = window.SKU_DECLARE[x.sku].d;
+                if(!x.nameCn) x.nameCn = window.SKU_DECLARE[x.sku].n;
+              }
+              return x;
+            });
+            renderWizard();
+            done(true,'<div class="hint ok" style="margin-top:10px">✅ 已通过后端代理从飞书云文档拉取 <b>'+data.items.length+'</b> 行（货件 '+esc(fid)+'）。请核对品名/数量/申报价。</div>');
+          } else {
+            throw new Error(data.error||'无数据');
+          }
+        }).catch(e=>{
+          setStep(2,'fail');
+          setBar(100);
+          done(false,'<div class="hint warn" style="margin-top:10px">⚠️ 货件号 <b>'+esc(fid)+'</b> 暂未预装，且本地后端代理不可用（'+esc(e.message)+'）。<br>① 直接点「<b>📤 上传装箱清单</b>」选本机的 xlsx；<br>② 确认本地后端已启动（双击 start_backend.bat）。</div>');
+        });
       }
     }, 400);
   }, 300);
