@@ -765,15 +765,27 @@ function runChecks(){
   if(missing.length) out.push({level:'err',name:'必填完整性',msg:'以下字段为空：'+missing.join('、')});
   else out.push({level:'ok',name:'必填完整性',msg:'收货人关键字段均已填'});
   let qtySum=0, decSum=0, itemErr=0;
-  W.form.items.forEach((it,i)=>{ if(!it.boxNo||!it.nameCn||!it.qty||!(it.declare!==''&&it.declare!=null)) itemErr++; qtySum+=parseFloat(it.qty)||0; decSum+=parseFloat(it.declare)||0; });
+  W.form.items.forEach((it,i)=>{
+    // 校验时反查 SKU 主数据（与 step3 渲染一致：原始空 → 用 sk.申报价/sk.中文品名）
+    const sk = W.skus.find(s=>s.sku===it.sku);
+    const effDeclare = (it.declare!==''&&it.declare!=null) ? it.declare : (sk && sk.申报价 ? sk.申报价 : '');
+    const effNameCn = it.nameCn || (sk ? sk.中文品名 : '');
+    if(!it.boxNo||!effNameCn||!it.qty||!(effDeclare!==''&&effDeclare!=null)) itemErr++;
+    qtySum+=parseFloat(it.qty)||0;
+    decSum+=(parseFloat(effDeclare)||0)*(parseFloat(it.qty)||0);
+  });
   if(itemErr) out.push({level:'err',name:'物品必填',msg:`有 ${itemErr} 行缺 箱号/品名/数量/申报价`});
   else out.push({level:'ok',name:'物品必填',msg:`${W.form.items.length} 行物品均完整`});
   const boxes=[...new Set(W.form.items.map(it=>it.boxNo).filter(Boolean))];
-  out.push({level:'ok',name:'勾稽·箱数',msg:`去重箱号 ${boxes.length} 个，物品行数 ${W.form.items.length} 行（逐箱多 SKU 属正常）`});
-  const calcRows = W.form.items.filter(it=>{ const sk=W.skus.find(s=>s.sku===it.sku); return (it.declare===''||it.declare==null) && (!sk||!sk.申报价) && it.cost!==''; }).length;
+  // qtySum/decSum 挂到该项上,让外层 reduce 能拿到(之前挂在 out 顶层是 bug)
+  out.push({level:'ok',name:'勾稽·箱数',msg:`去重箱号 ${boxes.length} 个，物品行数 ${W.form.items.length} 行（逐箱多 SKU 属正常）`, qtySum, decSum});
+  const calcRows = W.form.items.filter(it=>{
+    const sk=W.skus.find(s=>s.sku===it.sku);
+    const hasDeclare = (it.declare!==''&&it.declare!=null) || (sk&&sk.申报价);
+    return !hasDeclare && it.cost!=='';
+  }).length;
   if(calcRows) out.push({level:'warn',name:'推算申报价',msg:`${calcRows} 行无 SKU 主数据申报价，按成本×${COEFF}推算（标黄），需人审确认`});
   else out.push({level:'ok',name:'申报价来源',msg:'申报价均有 SKU 主数据支撑'});
-  out.qtySum=qtySum; out.decSum=decSum;
   return out;
 }
 async function step6(box){
