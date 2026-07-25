@@ -284,7 +284,7 @@ async function wizard(){
   const channels = await getAll('channels');
   const skus = await getAll('skus');
   const templates = (await getAll('templates')).filter(t=>t.状态!=='DISABLED');
-  W = { step:1, channels, skus, templates,
+  W = { step:1, channels, skus, templates, mode:'forward', handover:null,
         form:{ 物流商:'安速', 渠道:'美国包税-空派(普货)', 仓库代码:'SCK8', fbaNo:'', amazonRef:'', customs:'否', customInfo:'', items:[] },
         sources:{}, checks:null };
   renderWizard();
@@ -314,10 +314,26 @@ async function renderWizard(){
 }
 function step1(box){
   const f = W.form;
+  const isRev = W.mode==='reverse';
   box.innerHTML = `
   <div class="card">
     <h3>① 入口与装箱单（中枢单据）</h3>
-    <div class="hint">v1 以「手建装箱单」为主入口（质量最稳）；入口A 飞书单号直查、入口B 拖文件解析将在适配层(L2)后续接入。装箱单是所有取值的中枢。</div>
+    <div class="hint">两种录入方式：<b>正着填</b>逐项手填；<b>倒着填</b>输入单号，从已同步的「FBA箱唛交接」索引一次性抓取整行信息（装箱清单需先同步）。</div>
+    <div class="seg">
+      <button class="seg-btn ${!isRev?'on':''}" id="m_forward">正着填（手动）</button>
+      <button class="seg-btn ${isRev?'on':''}" id="m_reverse">倒着填（按单号搜）</button>
+    </div>
+    ${isRev ? reversePanelHTML() : forwardPanelHTML(f)}
+  </div>
+  <div style="margin-top:14px"><button class="btn" id="next1">下一步：反查收货人 →</button></div>`;
+  $('#m_forward').onclick=()=>{W.mode='forward';renderWizard();};
+  $('#m_reverse').onclick=()=>{W.mode='reverse';W.handover=null;renderWizard();};
+  if(isRev){ bindReverse(); }
+  else { bindForward(f); }
+  $('#next1').onclick = ()=>{ if(!isRev) captureForward(f); W.step=2; renderWizard(); };
+}
+function forwardPanelHTML(f){
+  return `
     <div class="row">
       <div><label>物流商</label><select id="f_物流商">${[...new Set(W.channels.map(c=>c.物流商))].map(o=>`<option ${o===f.物流商?'selected':''}>${o}</option>`).join('')}</select></div>
       <div><label>渠道</label><select id="f_渠道">${W.channels.filter(c=>c.物流商===f.物流商).map(c=>`<option ${c.渠道===f.渠道?'selected':''}>${c.渠道}</option>`).join('')}</select></div>
@@ -328,15 +344,73 @@ function step1(box){
       <div><label>Amazon Reference ID</label><input id="f_amazonRef" value="${esc(f.amazonRef)}" placeholder="4F7O73TF"></div>
       <div><label>报关(否/是)</label><select id="f_customs"><option ${f.customs==='否'?'selected':''}>否</option><option ${f.customs==='是'?'selected':''}>是</option></select></div>
     </div>
-    <label>自定义信息</label><input id="f_customInfo" value="${esc(f.customInfo)}" placeholder="可留空">
-  </div>
-  <div style="margin-top:14px"><button class="btn" id="next1">下一步：反查收货人 →</button></div>`;
+    <label>自定义信息</label><input id="f_customInfo" value="${esc(f.customInfo)}" placeholder="可留空">`;
+}
+function bindForward(f){
   $('#f_物流商').onchange = e=>{ f.物流商=e.target.value; const ch=W.channels.find(c=>c.物流商===f.物流商); f.渠道=ch?ch.渠道:f.渠道; f.仓库代码=ch&&ch.仓库[0]?ch.仓库[0].代码:f.仓库代码; renderWizard(); };
   $('#f_渠道').onchange = e=>{ f.渠道=e.target.value; const ch=W.channels.find(c=>c.物流商===f.物流商&&c.渠道===f.渠道); f.仓库代码=ch&&ch.仓库[0]?ch.仓库[0].代码:f.仓库代码; renderWizard(); };
   $('#f_仓库代码').onchange = e=>{ f.仓库代码=e.target.value; };
   const cap = ()=>{ f.fbaNo=$('#f_fbaNo').value; f.amazonRef=$('#f_amazonRef').value; f.customs=$('#f_customs').value; f.customInfo=$('#f_customInfo').value; };
   ['#f_fbaNo','#f_amazonRef','#f_customs','#f_customInfo'].forEach(s=>$(s).onchange=cap);
-  $('#next1').onclick = ()=>{ cap(); W.step=2; renderWizard(); };
+}
+function captureForward(f){ f.fbaNo=$('#f_fbaNo').value; f.amazonRef=$('#f_amazonRef').value; f.customs=$('#f_customs').value; f.customInfo=$('#f_customInfo').value; }
+function reversePanelHTML(){
+  const n=(window.HANDOVER_INDEX||[]).length;
+  return `
+    <div class="hint ok">数据源：本机已同步的「FBA箱唛交接」索引（${n} 票）。输入单号 → 搜索 → 确认即抓取整行信息。</div>
+    <div class="row"><div style="flex:1"><label>内部单号 / 聚水潭 或 FBA货件号</label><input id="rev_q" placeholder="如 DAFA-EXP 或 FBA15K43YSGT" autocomplete="off"></div></div>
+    <div id="rev_res" class="rev-res"></div>
+    <div id="rev_confirm"></div>`;
+}
+function bindReverse(){
+  const q=$('#rev_q'); const res=$('#rev_res');
+  q.oninput=()=>{
+    const key=(q.value||'').trim().toLowerCase();
+    res.innerHTML=''; $('#rev_confirm').innerHTML='';
+    if(key.length<2) return;
+    const all=window.HANDOVER_INDEX||[];
+    const hits=all.filter(r=> (r.internal_no&&r.internal_no.toLowerCase().includes(key)) || (r.fba_shipment&&r.fba_shipment.toLowerCase().includes(key)) ).slice(0,30);
+    if(hits.length===0){ res.innerHTML='<div class="hint">未找到匹配。可检查单号，或切回「正着填」，或先执行数据同步。</div>'; return; }
+    res.innerHTML = hits.map((r,i)=>`<div class="rev-item" data-i="${i}"><span><b>${esc(r.internal_no||'(无内部单号)')}</b> / ${esc(r.fba_shipment||'(无FBA号)')}</span><span class="muted">${esc(r.物流商||'?')} · ${esc(r.country||'?')} · ${esc(r.boxes||'?')}箱 · ${esc(r.packing_list||'无装箱清单')}</span></div>`).join('');
+    res.querySelectorAll('.rev-item').forEach(el=> el.onclick=()=> showConfirm(hits[+el.dataset.i]) );
+  };
+}
+function showConfirm(r){
+  const c=$('#rev_confirm');
+  c.innerHTML = `
+    <div class="card" style="margin-top:10px">
+      <div class="hint warn">请确认这是你要的单（防取错）：</div>
+      <table class="kv">
+        <tr><td>内部单号</td><td>${esc(r.internal_no)}</td></tr>
+        <tr><td>FBA货件号</td><td>${esc(r.fba_shipment)}</td></tr>
+        <tr><td>物流商</td><td>${esc(r.物流商)}</td></tr>
+        <tr><td>国家</td><td>${esc(r.country)}</td></tr>
+        <tr><td>空/海运</td><td>${esc(r.air_sea)}</td></tr>
+        <tr><td>箱数</td><td>${esc(r.boxes)}</td></tr>
+        <tr><td>取件方式(地址)</td><td>${esc(r.pickup_addr)}</td></tr>
+        <tr><td>装箱清单</td><td>${esc(r.packing_list)}</td></tr>
+        <tr><td>FNSKU信息</td><td>${esc(r.fnsku_file)}</td></tr>
+        <tr><td>发票-物流填</td><td>${esc(r.invoice_drop)}</td></tr>
+      </table>
+      <div style="display:flex;gap:10px;margin-top:8px">
+        <button class="btn" id="rev_ok">确认采用，抓取信息 →</button>
+        <button class="btn secondary" id="rev_cancel">重选</button>
+      </div>
+    </div>`;
+  $('#rev_cancel').onclick=()=>{ c.innerHTML=''; };
+  $('#rev_ok').onclick=()=> applyHandover(r);
+}
+function applyHandover(r){
+  const f=W.form; W.handover=r;
+  f.fbaNo = r.fba_shipment || r.internal_no;
+  if(r.物流商 && W.channels.some(c=>c.物流商===r.物流商)) f.物流商=r.物流商;
+  const sameCarrier = W.channels.filter(c=>c.物流商===f.物流商);
+  const byCountry = sameCarrier.find(c=>c.国家 && r.country && c.国家.includes(r.country));
+  f.渠道 = (byCountry||sameCarrier[0]||{渠道:f.渠道}).渠道;
+  const whByC = { '美国':'SCK8', '沙特':'RUH8' };
+  if(whByC[r.country]) f.仓库代码=whByC[r.country];
+  f.customInfo = r.invoice_drop || f.customInfo;
+  W.step=2; renderWizard();
 }
 function warehouseOptions(f){
   const ch = W.channels.find(c=>c.物流商===f.物流商&&c.渠道===f.渠道);
@@ -413,6 +487,7 @@ function step3(box){
     <h3>③ 物品明细（装箱单行项目）</h3>
     <div class="hint">填 SKU 自动反查中文品名/材质/HS/品牌/型号，并带出<b>申报价</b>（绿=SKU主数据；黄=无主数据按成本×${COEFF}推算，需人审确认）。</div>
     <datalist id="skuList">${W.skus.map(s=>`<option value="${s.sku}">${s.中文品名}</option>`).join('')}</datalist>
+    ${ W.handover && W.handover.packing_list ? packingBannerHTML(W.handover.packing_list) : '' }
     <div style="overflow:auto"><table>
       <thead><tr><th>箱号</th><th>SKU</th><th>中文</th><th>英文</th><th>数量</th><th>申报价(USD)</th><th>材质</th><th>HS</th><th>品牌</th><th>型号</th><th>箱重</th><th>长</th><th>宽</th><th>高</th><th>电</th><th>磁</th><th>销售链接</th><th></th></tr></thead>
       <tbody id="rows">${renderRows()}</tbody>
@@ -425,6 +500,49 @@ function step3(box){
   $('#addRow').onclick=addRow;
   $('#prev3').onclick=()=>{W.step=2;renderWizard();};
   $('#next3').onclick=()=>{W.step=4;renderWizard();};
+  if(W.handover && W.handover.packing_list){
+    const pl=$('#pl_load'); if(pl) pl.onclick=()=> loadPackingList(W.handover.packing_list);
+    const pf=$('#pl_file'); if(pf) pf.onchange=e=>{ const file=e.target.files[0]; if(!file) return; const rd=new FileReader(); rd.onload=()=>{ const items=parsePackingList(rd.result); const msg=$('#pl_msg'); if(items.length){ W.form.items=items; msg.textContent='已上传并填入 '+items.length+' 行。'; renderWizard(); } else msg.textContent='解析为空。'; }; rd.readAsText(file); };
+  }
+}
+function packingBannerHTML(fn){
+  return `
+  <div class="card" style="margin-top:10px;border-color:#2b6cb0">
+    <div class="hint ok">检测到该单关联装箱清单：<b>${esc(fn)}</b>（倒填核心：整张装箱内容一次性抓过来）</div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn" id="pl_load">← 从装箱清单一键填入物品明细</button>
+      <label class="btn secondary" style="margin:0">或上传装箱清单 CSV<input type="file" id="pl_file" accept=".csv" style="display:none"></label>
+      <span id="pl_msg" class="muted"></span>
+    </div>
+  </div>`;
+}
+async function loadPackingList(fn){
+  const msg=$('#pl_msg');
+  try{
+    const r=await fetch('./packing_lists/'+encodeURIComponent(fn));
+    if(!r.ok){ msg.textContent='本地未同步该装箱清单，请点「上传」或先执行数据同步。'; return; }
+    const text=await r.text();
+    const items=parsePackingList(text);
+    if(items.length){ W.form.items=items; msg.textContent='已填入 '+items.length+' 行（来自装箱清单）。'; renderWizard(); }
+    else { msg.textContent='解析装箱清单为空，请检查文件格式。'; }
+  }catch(e){ msg.textContent='加载失败：'+e.message; }
+}
+function parsePackingList(text){
+  const lines=text.split(/\r?\n/).filter(l=>l.trim());
+  if(lines.length<2) return [];
+  const splitCsv=line=> line.split(',').map(s=>s.trim().replace(/^"|"$/g,''));
+  const hdr=splitCsv(lines[0]).map(h=>h.toLowerCase());
+  const map={'boxNo':['箱号','箱','carton','boxno','ctn'],'sku':['sku'],'nameCn':['中文品名','品名','名称','namecn'],'nameEn':['英文品名','英文名称','nameen'],'qty':['数量','qty','quantity'],'declare':['申报价','申报价值','declare','price'],'material':['材质','material'],'hs':['hs','海关编码'],'brand':['品牌','brand'],'model':['型号','model'],'boxWeight':['箱重','重量','weight'],'len':['长','length'],'wid':['宽','width'],'hgt':['高','height'],'elec':['带电','elec'],'magnet':['带磁','magnet'],'saleUrl':['销售链接','链接','url','saleurl']};
+  const idx={};
+  for(const f in map){ const i=hdr.findIndex(h=>map[f].some(k=>h.includes(k))); if(i>=0) idx[f]=i; }
+  const out=[];
+  for(let n=1;n<lines.length;n++){
+    const c=splitCsv(lines[n]);
+    if(c.every(x=>!x)) continue;
+    const get=f=> idx[f]>=0 ? c[idx[f]] : '';
+    out.push({boxNo:get('boxNo'),sku:get('sku'),nameCn:get('nameCn'),nameEn:get('nameEn'),qty:get('qty')||1,declare:get('declare'),material:get('material'),hs:get('hs'),brand:get('brand'),model:get('model'),boxWeight:get('boxWeight'),len:get('len'),wid:get('wid'),hgt:get('hgt'),elec:(get('elec')||'N').toUpperCase().startsWith('Y')?'Y':'N',magnet:(get('magnet')||'N').toUpperCase().startsWith('Y')?'Y':'N',saleUrl:get('saleUrl'),cost:''});
+  }
+  return out;
 }
 function step4(box){
   const tmpls = W.templates;
