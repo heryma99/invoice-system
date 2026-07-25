@@ -35,6 +35,10 @@ function del(store,id){
   if(!USE_DB){ mem[store]=(mem[store]||[]).filter(x=>x.id!==id); return Promise.resolve(); }
   return new Promise((res,rej)=>{ const r=_idb(store,'readwrite').delete(id); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); });
 }
+function clear(store){
+  if(!USE_DB){ mem[store]=[]; return Promise.resolve(); }
+  return new Promise((res,rej)=>{ const r=_idb(store,'readwrite').clear(); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); });
+}
 const uid = ()=> Date.now().toString(36)+Math.random().toString(36).slice(2,7);
 
 /* ---------- 5 家物流商模板字段映射(由 inspect_all.js 解析得到) ---------- */
@@ -205,12 +209,15 @@ async function seedIfEmpty(){
     await put('warehouses',{id:'wh_ruh8',代码:'RUH8',公司:'Amazon RUH8',省份:'',城市:'Riyadh',地址:'RUH8',邮编:'',电话:'0'});
     await put('warehouses',{id:'wh_tcy1',代码:'TCY1',公司:'TCY1',省份:'CA',城市:'STOCKTON',地址:'2690 East Arch Airport Road',邮编:'95206',电话:'0'});
   }
-  const sk = await getAll('skus');
-  if(sk.length===0){
-    await put('skus',{id:'sk_1',sku:'8T026-12',中文品名:'单肩包',英文品名:'Shoulder Bag',材质:'PU',HS:'4202220000',品牌:'JW PEI',型号:'8T026-12',申报价:20.57,成本:14.5,
-      版本:[{v:1,值:20.57,生效日:'2026-07-01',原因:'初始申报价'}],图片:''});
-    await put('skus',{id:'sk_2',sku:'8T030-08',中文品名:'托特包',英文品名:'Tote Bag',材质:'PU',HS:'4202220000',品牌:'JW PEI',型号:'8T030-08',申报价:25.1,成本:18,
-      版本:[{v:1,值:25.1,生效日:'2026-07-01',原因:'初始申报价'}],图片:''});
+  // SKU 主数据：从烘焙的 window.SKUS(商品申报信息同步) seed；版本号变更则重 seed
+  // 声明价值来源 = 商品申报信息.成本价(人民币) ÷ 汇率(见 sync_master.py RATE)，带版本号可复验
+  const SKUS_SEED_VER = 2;
+  let skusSeeded = false;
+  try { skusSeeded = localStorage.getItem('skus_seeded_ver') === String(SKUS_SEED_VER); } catch(e){}
+  if(!skusSeeded){
+    await clear('skus');
+    for(const s of (window.SKUS||[])){ await put('skus', s); }
+    try { localStorage.setItem('skus_seeded_ver', String(SKUS_SEED_VER)); } catch(e){}
   }
   // 预置 5 家模板（同目录 fetch，仅 http 下可用；file:// 失败则手动上传）
   // 改为"按缺失补全"：避免旧版残留(空/失败记录)导致新模板永远拉不下来。
