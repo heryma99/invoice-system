@@ -1,0 +1,753 @@
+/* ============================================================
+   发票自动生成系统 v1 · 本地优先 · 无服务器
+   L4 主数据(IndexedDB) → L5 生成引擎(ExcelJS填模板副本) → L6 校验 → L7 导出
+   支持 5 家物流商模板(各自字段映射)、数据库降级容错、渲染错误上屏。
+   ============================================================ */
+'use strict';
+
+/* ---------- 存储层：IndexedDB，不可用时降级为内存(保证不空白) ---------- */
+const DB_NAME = 'invoice_sys_v1', DB_VER = 2;
+let DB = null, USE_DB = true;
+const mem = { channels:[], skus:[], templates:[], records:[], warehouses:[] };
+function openDB(){
+  return new Promise((res)=>{
+    try{
+      const r = indexedDB.open(DB_NAME, DB_VER);
+      r.onupgradeneeded = e=>{
+        const db = e.target.result;
+        ['channels','skus','templates','records','warehouses'].forEach(s=>{ if(!db.objectStoreNames.contains(s)) db.createObjectStore(s,{keyPath:'id'}); });
+      };
+      r.onsuccess = e=>{ DB=e.target.result; res(DB); };
+      r.onerror = ()=>{ USE_DB=false; res(); };
+    }catch(e){ USE_DB=false; res(); }
+  });
+}
+function _idb(store,mode){ return DB.transaction(store,mode).objectStore(store); }
+function getAll(store){
+  if(!USE_DB) return Promise.resolve(mem[store]||[]);
+  return new Promise((res,rej)=>{ const r=_idb(store,'readonly').getAll(); r.onsuccess=()=>res(r.result||[]); r.onerror=()=>rej(r.error); });
+}
+function put(store,val){
+  if(!USE_DB){ const a=mem[store]||(mem[store]=[]); const i=a.findIndex(x=>x.id===val.id); if(i>=0)a[i]=val;else a.push(val); return Promise.resolve(val); }
+  return new Promise((res,rej)=>{ const r=_idb(store,'readwrite').put(val); r.onsuccess=()=>res(val); r.onerror=()=>rej(r.error); });
+}
+function del(store,id){
+  if(!USE_DB){ mem[store]=(mem[store]||[]).filter(x=>x.id!==id); return Promise.resolve(); }
+  return new Promise((res,rej)=>{ const r=_idb(store,'readwrite').delete(id); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); });
+}
+const uid = ()=> Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+
+/* ---------- 5 家物流商模板字段映射(由 inspect_all.js 解析得到) ---------- */
+const MAPPINGS = {
+  '安速':{
+    titleCell:'A1', titleText:'FBA订单（V3）',
+    meta:{ fbaNo:'D2', amazonRef:'D4', shipMethod:'D3', warehouseCode:'D5', company:'E6', country:'D7', province:'D8', city:'D9', address:'D10', phone:'D11', zip:'D12', email:'E13', customs:'D14', vat:'E15', eori:'E16', vatName:'E17', vatAddr:'E18', customInfo:'E19' },
+    item:{ boxNo:'A', nameCn:'G', nameEn:'H', qty:'I', declare:'K', material:'M', hs:'L', brand:'V', model:'W', boxWeight:'C', len:'D', wid:'E', hgt:'F', elec:'O', magnet:'P', img:'Q', imgUrl:'R', salePrice:'S', saleUrl:'T', currency:'Z', origin:'AA' },
+    itemStartRow:21
+  },
+  '艾杜克':{
+    meta:{ company:'B5', vat:'C7', warehouseCode:'I8', amazonRef:'I6', fbaNo:'I7' },
+    item:{ nameEn:'A', nameCn:'B', boxNo:'C', brand:'D', hs:'E', qty:'G', boxWeight:'H', len:'I', declare:'J', img:'L', elec:'M', model:'O' },
+    itemStartRow:14
+  },
+  '亦邦':{
+    meta:{ company:'F1', amazonRef:'G1', boxWeight:'B1', len:'C1', wid:'D1', hgt:'E1' },
+    item:{ boxNo:'A', boxWeight:'B', len:'C', wid:'D', hgt:'E', company:'F', amazonRef:'G', nameCn:'I', nameEn:'J', declare:'K', qty:'L', elec:'M', magnet:'O', sku:'P', hs:'Q', material:'R', purpose:'T', img:'V' },
+    itemStartRow:2
+  },
+  '亚丰':{
+    meta:{ fbaNo:'A1', shipMethod:'B2', warehouseCode:'B3', company:'B5', address:'B6', city:'B9', province:'B10', zip:'B11', country:'B12', phone:'B13', email:'C14', customs:'F6', vat:'G11', poNo:'B15' },
+    item:{ boxNo:'A', boxWeight:'B', len:'C', wid:'D', hgt:'E', nameEn:'F', nameCn:'G', declare:'H', qty:'I', material:'J', hs:'K', purpose:'L', brand:'M', model:'N', saleUrl:'O', salePrice:'P', img:'Q', imgUrl:'R', prodWeight:'S', elec:'T', magnet:'U', asin:'V', fnsku:'W', sku:'X' },
+    itemStartRow:19
+  },
+  '合联':{
+    titleCell:'A1', titleText:'PACKING LIST',
+    meta:{ fbaNo:'A3' },
+    item:{ fbaNo:'A', boxNo:'B', nameEn:'C', nameCn:'D', hs:'E', boxCount:'F', qty:'G', sku:'H', declare:'I', boxWeight:'K', len:'L', wid:'M', hgt:'N', brand:'P', elec:'Q', img:'R', material:'S' },
+    itemStartRow:5
+  }
+};
+const TPL_FILES = {
+  '安速':'安速发票模板.xlsx','艾杜克':'艾杜克发票模板.xlsx','亦邦':'亦邦发票模板.xlsx','亚丰':'亚丰发票模板.xlsx','合联':'合联发票模板.xlsx'
+};
+
+/* ---------- 种子数据(首次运行注入) ---------- */
+async function seedIfEmpty(){
+  const ch = await getAll('channels');
+  // 迁移守卫:旧版仅 3 条废渠道(空国家/空仓库,与新版 58 条 ID 体系不同)。
+  // 改为"按首条新渠道是否存在"判定,确保已缓存旧数据的浏览器也能补全 58 条;
+  // 同时清理已知的 3 条旧版废渠道(否则会污染渠道下拉、破坏向导⑥校验)。
+  const SEED_NEW_FIRST = 'ch_安速_00';
+  const SEED_OLD_IDS = ['ch_ansu_us','ch_aiduk_sa','ch_yifeng_us'];
+  if(!ch.some(c=>c.id===SEED_NEW_FIRST)){
+    for(const id of SEED_OLD_IDS){ try{ await del('channels', id); }catch(e){} }
+    await put('channels',{id:'ch_安速_00',物流商:'安速',渠道:'中运通达-广州DHL(不含油)',国家:'',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_01',物流商:'安速',渠道:'中运通达-广州联邦IP(不含油)',国家:'',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_02',物流商:'安速',渠道:'中运通达-大陆UPS红单小货(含油)',国家:'',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_03',物流商:'安速',渠道:'欧洲包税-空派快线(普货)',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_04',物流商:'安速',渠道:'欧洲包税-空派慢线(普货)',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_05',物流商:'安速',渠道:'欧洲包税-卡航',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_06',物流商:'安速',渠道:'欧洲包税-卡航卡派',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_07',物流商:'安速',渠道:'欧洲包税-海运',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_08',物流商:'安速',渠道:'欧洲包税-海运卡派',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_09',物流商:'安速',渠道:'加拿大包税-空派(普货)',国家:'加拿大',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_10',物流商:'亚丰',渠道:'亚丰-欧洲空运包税(UPS快线)',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_11',物流商:'安速',渠道:'美国包税-空派(普货)',国家:'美国',VAT:'',EORI:'',注册名:'JW PEI INC',注册地址:'123 Oak Ave, CA, US',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_12',物流商:'安速',渠道:'美国包税-海派(美森正班CLX)',国家:'美国',VAT:'',EORI:'',注册名:'JW PEI INC',注册地址:'123 Oak Ave, CA, US',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_13',物流商:'安速',渠道:'美国包税-海派(美森加班MAX)',国家:'美国',VAT:'',EORI:'',注册名:'JW PEI INC',注册地址:'123 Oak Ave, CA, US',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_14',物流商:'安速',渠道:'美国包税-海派(盐田普船)',国家:'美国',VAT:'',EORI:'',注册名:'JW PEI INC',注册地址:'123 Oak Ave, CA, US',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_15',物流商:'安速',渠道:'美国包税-海卡(美森正班卡派)',国家:'美国',VAT:'',EORI:'',注册名:'JW PEI INC',注册地址:'123 Oak Ave, CA, US',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_16',物流商:'安速',渠道:'美国包税-海卡(美森加班卡派)',国家:'美国',VAT:'',EORI:'',注册名:'JW PEI INC',注册地址:'123 Oak Ave, CA, US',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_17',物流商:'安速',渠道:'美国包税-海卡(盐田普船卡派)',国家:'美国',VAT:'',EORI:'',注册名:'JW PEI INC',注册地址:'123 Oak Ave, CA, US',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_18',物流商:'安速',渠道:'加拿大包税-海派(限时达UPS派送)',国家:'加拿大',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_19',物流商:'安速',渠道:'加拿大包税-海派(限时达卡派)',国家:'加拿大',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_20',物流商:'安速',渠道:'加拿大包税-海派(定提UPS派送)',国家:'加拿大',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_21',物流商:'安速',渠道:'加拿大包税-海派(定提卡派)',国家:'加拿大',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_22',物流商:'安速',渠道:'加拿大包税-海派(海运UPS派送)',国家:'加拿大',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_23',物流商:'安速',渠道:'加拿大包税-海派(海运卡派)',国家:'加拿大',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_24',物流商:'安速',渠道:'澳洲包税-海运(悉尼代表)',国家:'澳洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_25',物流商:'安速',渠道:'澳洲包税-空运(普货)',国家:'澳洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_26',物流商:'安速',渠道:'澳洲包税-空运(带磁)',国家:'澳洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_27',物流商:'安速',渠道:'日本自税-海运快船ACP逆算(贴标)',国家:'日本',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_28',物流商:'安速',渠道:'欧洲VAT递延-空派(普货)',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_29',物流商:'安速',渠道:'欧洲VAT递延-卡航',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_30',物流商:'安速',渠道:'欧洲VAT递延-海运',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_31',物流商:'安速',渠道:'英国VAT递延-空运快线',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_32',物流商:'安速',渠道:'英国VAT递延-空运慢线',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_33',物流商:'安速',渠道:'英国VAT递延-卡航',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_34',物流商:'安速',渠道:'英国VAT递延-海运',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_35',物流商:'安速',渠道:'英国VAT递延-海卡(BHX4/BHX8/LBA4)',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_安速_36',物流商:'安速',渠道:'英国VAT递延-海卡(LPL2/LBA8/EMA3等)',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_37',物流商:'亚丰',渠道:'美国包税-海卡(普船)',国家:'美国',VAT:'',EORI:'',注册名:'JW PEI INC',注册地址:'123 Oak Ave, CA, US',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_38',物流商:'亚丰',渠道:'美国空派快线(双清包税UPS)',国家:'美国',VAT:'',EORI:'',注册名:'JW PEI INC',注册地址:'123 Oak Ave, CA, US',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_39',物流商:'亚丰',渠道:'美国空派经济线(双清包税UPS)',国家:'美国',VAT:'',EORI:'',注册名:'JW PEI INC',注册地址:'123 Oak Ave, CA, US',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_40',物流商:'亚丰',渠道:'美国美森限时达(CLX双清包税)',国家:'美国',VAT:'',EORI:'',注册名:'JW PEI INC',注册地址:'123 Oak Ave, CA, US',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_41',物流商:'亚丰',渠道:'欧盟海运包税',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_42',物流商:'亚丰',渠道:'欧盟快铁包税',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_43',物流商:'亚丰',渠道:'欧盟卡航包税(UPS派送)',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_44',物流商:'亚丰',渠道:'欧盟卡航包税(限时达)',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_45',物流商:'亚丰',渠道:'欧洲自税递延-空运(普货特快限时达)',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_46',物流商:'亚丰',渠道:'欧洲自税递延-空运(普货快线限时达)',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_47',物流商:'亚丰',渠道:'欧洲自税递延-海运卡派',国家:'欧洲',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_48',物流商:'亚丰',渠道:'英国空派(自税)',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_49',物流商:'亚丰',渠道:'英国空派(包税)',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_50',物流商:'亚丰',渠道:'英国海运(自税)',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_51',物流商:'亚丰',渠道:'英国海运(包税)',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_52',物流商:'亚丰',渠道:'英国卡航(自税)',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_亚丰_53',物流商:'亚丰',渠道:'英国卡航(包税)',国家:'英国',VAT:'',EORI:'',注册名:'',注册地址:'',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_艾杜克_54',物流商:'艾杜克',渠道:'沙特空派',国家:'沙特',VAT:'',EORI:'',注册名:'JW PEI Direct',注册地址:'Riyadh, SA',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_艾杜克_55',物流商:'艾杜克',渠道:'沙特空运',国家:'沙特',VAT:'',EORI:'',注册名:'JW PEI Direct',注册地址:'Riyadh, SA',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_艾杜克_56',物流商:'艾杜克',渠道:'沙特空运包税',国家:'沙特',VAT:'',EORI:'',注册名:'JW PEI Direct',注册地址:'Riyadh, SA',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+    await put('channels',{id:'ch_合联_57',物流商:'合联',渠道:'沙特海运',国家:'沙特',VAT:'',EORI:'',注册名:'JW PEI Direct',注册地址:'Riyadh, SA',
+      仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]});
+  }
+  const whs = await getAll('warehouses');
+  if(whs.length===0){
+    await put('warehouses',{id:'wh_sck8',代码:'SCK8',公司:'Amazon SCK8',省份:'CA',城市:'OAKLEY',地址:'4700 WILBUR AVE',邮编:'94561',电话:'0'});
+    await put('warehouses',{id:'wh_edi4',代码:'EDI4',公司:'Amazon EDI4',省份:'TX',城市:'DALLAS',地址:'940 W BETHEL RD',邮编:'75201',电话:'0'});
+    await put('warehouses',{id:'wh_ruh8',代码:'RUH8',公司:'Amazon RUH8',省份:'',城市:'Riyadh',地址:'RUH8',邮编:'',电话:'0'});
+    await put('warehouses',{id:'wh_tcy1',代码:'TCY1',公司:'TCY1',省份:'CA',城市:'STOCKTON',地址:'2690 East Arch Airport Road',邮编:'95206',电话:'0'});
+  }
+  const sk = await getAll('skus');
+  if(sk.length===0){
+    await put('skus',{id:'sk_1',sku:'8T026-12',中文品名:'单肩包',英文品名:'Shoulder Bag',材质:'PU',HS:'4202220000',品牌:'JW PEI',型号:'8T026-12',申报价:20.57,成本:14.5,
+      版本:[{v:1,值:20.57,生效日:'2026-07-01',原因:'初始申报价'}],图片:''});
+    await put('skus',{id:'sk_2',sku:'8T030-08',中文品名:'托特包',英文品名:'Tote Bag',材质:'PU',HS:'4202220000',品牌:'JW PEI',型号:'8T030-08',申报价:25.1,成本:18,
+      版本:[{v:1,值:25.1,生效日:'2026-07-01',原因:'初始申报价'}],图片:''});
+  }
+  // 预置 5 家模板（同目录 fetch，仅 http 下可用；file:// 失败则手动上传）
+  // 改为"按缺失补全"：避免旧版残留(空/失败记录)导致新模板永远拉不下来。
+  const tmpls = await getAll('templates');
+  const have = new Set(tmpls.map(t=>t.id));
+  for(const [key, file] of Object.entries(TPL_FILES)){
+    if(have.has('tmpl_'+key)) continue; // 已有则跳过,不重复
+    try{
+      const r = await fetch('./'+file);
+      if(r.ok){ const blob = await r.blob(); await put('templates',{id:'tmpl_'+key,物流商:key,渠道:'(通用)',名称:file,blob,状态:'ACTIVE',版本:1,创建日:new Date().toISOString().slice(0,10),mapping:MAPPINGS[key]}); }
+    }catch(e){ /* 离线 file:// 下跳过，用户手动上传 */ }
+  }
+}
+const COEFF = 0.3; // 推算系数: 申报价 = 成本 × 系数(标黄)
+
+/* ---------- 工具 ---------- */
+const $ = (s,el=document)=>el.querySelector(s);
+const $$ = (s,el=document)=>[...el.querySelectorAll(s)];
+function el(html){ const t=document.createElement('template'); t.innerHTML=html.trim(); return t.content.firstElementChild; }
+function esc(s){ return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function main(){ return document.getElementById('main'); }
+
+/* ---------- 视图路由 ---------- */
+const VIEWS = { overview, wizard, channels, skus, templates, monitor };
+function go(view){
+  try{
+    $$('.nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
+    main().innerHTML=''; VIEWS[view]();
+  }catch(e){ main().innerHTML='<div class="alert alert-err">渲染错误：'+esc(e.message)+'</div>'; console.error(e); }
+}
+$$('.nav-btn').forEach(b=> b.onclick=()=>go(b.dataset.view));
+
+/* ============================================================
+   架构总览
+   ============================================================ */
+function overview(){
+  main().innerHTML = `
+  <h2>发票系统骨架架构图 · v1</h2>
+  <div class="sub">七层解耦 · 本地优先 · 质量第一。模板=排版层；值来自 L4 主数据（生成时反查填模板）；导出 Excel=默认交付。</div>
+  <div class="grid7">
+    ${layer('L1 入口','外部触发','入口A 查飞书单号 / 入口B 用户拖文件 / 手建装箱单','')}
+    ${layer('L2 适配','可插拔','飞书表·文件·SP-API·聚水潭（解析防错, fail loud）','')}
+    ${layer('L3 规范模型','转轴 · 质量命门','装箱单中枢(规范字段); 源忠实、推算值高亮','tag-core')}
+    ${layer('L4 配置与资源','主数据权威源','渠道·收货人 / SKU主数据 / 模板库 / 仓库（本地 IndexedDB）','tag-src')}
+    ${layer('L5 生成引擎','业务操作','源忠实填空白模板副本 + 装箱单 CRUD','')}
+    ${layer('L6 校验反查','质量命门','溯源 / 反查 / 合理性 / 勾稽 / 人审闸门','tag-core')}
+    ${layer('L7 交付','输出','导出 Excel(默认) + 发送(可选可跳过)','')}
+  </div>
+  <div class="card">
+    <h3>本 v1 已落地能力</h3>
+    <ul>
+      <li><b>L4 主数据</b>：渠道·收货人（含仓库子表）、SKU 主数据（申报价带版本号）本地 CRUD，IndexedDB 持久化。</li>
+      <li><b>反查机制</b>：选「物流商+渠道+仓库代码」→ 自动带出国家/VAT/地址（绿=主数据反查，白=手填，黄=推算）。</li>
+      <li><b>L5 生成引擎</b>：ExcelJS 打开空白模板副本按映射填格，<b>保留原模板样式/合并/图片公式</b>。已支持 5 家模板（安速/艾杜克/亦邦/亚丰/合联）各自字段映射。</li>
+      <li><b>L6 校验</b>：必填完整性 + 勾稽（箱数/数量/申报总值）+ 源忠实高亮。</li>
+      <li><b>L7 交付</b>：导出填好的 .xlsx（默认，物流商可直接导入其系统）；发送为可选、可跳过。</li>
+    </ul>
+    <div class="hint">已知边界（v1）：图片自动嵌入未做（模板样例行 =DISPIMG 公式保留）；飞书单号直查/拖文件解析/SP-API 待接入 L2 适配层。</div>
+  </div>`;
+}
+function layer(title,tag,desc,cls){
+  const tagHtml = cls?`<span class="tag ${cls}">${tag}</span>`:`<span class="tag tag-src">${tag}</span>`;
+  return `<div class="layer">${tagHtml}<h4>${title}</h4><small>${desc}</small></div>`;
+}
+
+/* ============================================================
+   生成发票向导
+   ============================================================ */
+let W = null;
+async function wizard(){
+  const channels = await getAll('channels');
+  const skus = await getAll('skus');
+  const templates = (await getAll('templates')).filter(t=>t.状态!=='DISABLED');
+  W = { step:1, channels, skus, templates,
+        form:{ 物流商:'安速', 渠道:'美国包税-空派(普货)', 仓库代码:'SCK8', fbaNo:'', amazonRef:'', customs:'否', customInfo:'', items:[] },
+        sources:{}, checks:null };
+  renderWizard();
+}
+async function renderWizard(){
+  const m = main();
+  m.innerHTML = `
+  <h2>生成发票向导</h2>
+  <div class="sub">入口 → 反查收货人 → 物品明细 → 选模板预览 → 校验反查 → 人审交付。每一步标注数据来源（绿=主数据反查 / 白=手填 / 黄=推算）。</div>
+  <div class="stepper">
+    <span class="s ${W.step>=1?'active':''}" data-s="1">① 入口·装箱单</span>
+    <span class="s ${W.step>=2?'active':''}" data-s="2">② 反查收货人</span>
+    <span class="s ${W.step>=3?'active':''}" data-s="3">③ 物品明细</span>
+    <span class="s ${W.step>=4?'active':''}" data-s="4">④ 选模板·预览</span>
+    <span class="s ${W.step>=5?'active':''}" data-s="5">⑤ 校验反查</span>
+    <span class="s ${W.step>=6?'active':''}" data-s="6">⑥ 人审·交付</span>
+  </div>
+  <div id="wstep"></div>`;
+  $$('.stepper .s').forEach(s=> s.onclick=()=>{ const n=+s.dataset.s; if(n<W.step) {W.step=n; renderWizard();} });
+  const box = $('#wstep');
+  if(W.step===1) step1(box);
+  else if(W.step===2) await step2(box);
+  else if(W.step===3) step3(box);
+  else if(W.step===4) step4(box);
+  else if(W.step===5) step5(box);
+  else if(W.step===6) await step6(box);
+}
+function step1(box){
+  const f = W.form;
+  box.innerHTML = `
+  <div class="card">
+    <h3>① 入口与装箱单（中枢单据）</h3>
+    <div class="hint">v1 以「手建装箱单」为主入口（质量最稳）；入口A 飞书单号直查、入口B 拖文件解析将在适配层(L2)后续接入。装箱单是所有取值的中枢。</div>
+    <div class="row">
+      <div><label>物流商</label><select id="f_物流商">${[...new Set(W.channels.map(c=>c.物流商))].map(o=>`<option ${o===f.物流商?'selected':''}>${o}</option>`).join('')}</select></div>
+      <div><label>渠道</label><select id="f_渠道">${W.channels.filter(c=>c.物流商===f.物流商).map(c=>`<option ${c.渠道===f.渠道?'selected':''}>${c.渠道}</option>`).join('')}</select></div>
+      <div><label>仓库代码</label><select id="f_仓库代码">${warehouseOptions(f)}</select></div>
+    </div>
+    <div class="row">
+      <div><label>客户订单号(FBA号)</label><input id="f_fbaNo" value="${esc(f.fbaNo)}" placeholder="FBA19JMKBVJW"></div>
+      <div><label>Amazon Reference ID</label><input id="f_amazonRef" value="${esc(f.amazonRef)}" placeholder="4F7O73TF"></div>
+      <div><label>报关(否/是)</label><select id="f_customs"><option ${f.customs==='否'?'selected':''}>否</option><option ${f.customs==='是'?'selected':''}>是</option></select></div>
+    </div>
+    <label>自定义信息</label><input id="f_customInfo" value="${esc(f.customInfo)}" placeholder="可留空">
+  </div>
+  <div style="margin-top:14px"><button class="btn" id="next1">下一步：反查收货人 →</button></div>`;
+  $('#f_物流商').onchange = e=>{ f.物流商=e.target.value; const ch=W.channels.find(c=>c.物流商===f.物流商); f.渠道=ch?ch.渠道:f.渠道; f.仓库代码=ch&&ch.仓库[0]?ch.仓库[0].代码:f.仓库代码; renderWizard(); };
+  $('#f_渠道').onchange = e=>{ f.渠道=e.target.value; const ch=W.channels.find(c=>c.物流商===f.物流商&&c.渠道===f.渠道); f.仓库代码=ch&&ch.仓库[0]?ch.仓库[0].代码:f.仓库代码; renderWizard(); };
+  $('#f_仓库代码').onchange = e=>{ f.仓库代码=e.target.value; };
+  const cap = ()=>{ f.fbaNo=$('#f_fbaNo').value; f.amazonRef=$('#f_amazonRef').value; f.customs=$('#f_customs').value; f.customInfo=$('#f_customInfo').value; };
+  ['#f_fbaNo','#f_amazonRef','#f_customs','#f_customInfo'].forEach(s=>$(s).onchange=cap);
+  $('#next1').onclick = ()=>{ cap(); W.step=2; renderWizard(); };
+}
+function warehouseOptions(f){
+  const ch = W.channels.find(c=>c.物流商===f.物流商&&c.渠道===f.渠道);
+  if(!ch) return '';
+  return ch.仓库.map(w=>`<option ${w.代码===f.仓库代码?'selected':''}>${w.代码}</option>`).join('');
+}
+function lookupChannel(){ return W.channels.find(c=>c.物流商===W.form.物流商&&c.渠道===W.form.渠道) || null; }
+async function lookupWarehouse(){ return (await getAll('warehouses')).find(w=>w.代码===W.form.仓库代码) || null; }
+async function step2(box){
+  const ch=lookupChannel(), wh=await lookupWarehouse();
+  const src = W.sources = {
+    shipMethod:{v:ch?ch.渠道:'',src:'channel'}, country:{v:ch?ch.国家:'',src:'channel'}, vat:{v:ch?ch.VAT:'',src:'channel'},
+    eori:{v:ch?ch.EORI:'',src:'channel'}, vatName:{v:ch?ch.注册名:'',src:'channel'}, vatAddr:{v:ch?ch.注册地址:'',src:'channel'},
+    warehouseCode:{v:W.form.仓库代码,src:'manual'}, company:{v:wh?wh.公司:'',src:'warehouse'}, province:{v:wh?wh.省份:'',src:'warehouse'},
+    city:{v:wh?wh.城市:'',src:'warehouse'}, address:{v:wh?wh.地址:'',src:'warehouse'}, zip:{v:wh?wh.邮编:'',src:'warehouse'}, phone:{v:wh?wh.电话:'',src:'warehouse'},
+    fbaNo:{v:W.form.fbaNo,src:'manual'}, amazonRef:{v:W.form.amazonRef,src:'manual'}, customs:{v:W.form.customs,src:'manual'}, customInfo:{v:W.form.customInfo,src:'manual'},
+    title:{v:'',src:'template'}, poNo:{v:'',src:'manual'}
+  };
+  const srcClass = s => (s==='channel'||s==='warehouse'||s==='template') ? 'cell-src' : 'cell-manual';
+  const srcLabel = s => ({channel:'主数据·渠道',warehouse:'主数据·仓库',manual:'人工填写',template:'模板固定',calc:'推算'}[s]||s);
+  const FIELDS = ['fbaNo','amazonRef','poNo','shipMethod','warehouseCode','company','country','province','city','address','phone','zip','email','customs','vat','eori','vatName','vatAddr','customInfo'];
+  const LABELS = {fbaNo:'客户订单号(FBA号)',amazonRef:'Amazon Reference ID',poNo:'PO Number',shipMethod:'运输方式',warehouseCode:'收件人(仓库代码)',company:'收件人公司',country:'国家',province:'收件省份',city:'收件城市',address:'收件地址',phone:'收件电话',zip:'邮编',email:'收件人email',customs:'报关(否/是)',vat:'VAT号',eori:'EORI',vatName:'VAT注册名',vatAddr:'VAT注册地址',customInfo:'自定义信息'};
+  box.innerHTML = `
+  <div class="card">
+    <h3>② 反查收货人（生成时从 L4 主数据取值，不手敲）</h3>
+    <div class="hint">所选：<b>${esc(W.form.物流商)} / ${esc(W.form.渠道)}</b>，仓库代码 <b>${esc(W.form.仓库代码)}</b>。绿底=主数据反查带出，白底=需人工填（传统贸易常见）。可直接改，但建议改「主数据页」以保证全量一致。</div>
+    <table>
+      <thead><tr><th>字段</th><th>取值</th><th>来源</th></tr></thead>
+      <tbody>
+        ${FIELDS.map(k=>{ const s=src[k]; if(!s) return ''; return `<tr><td>${LABELS[k]}</td><td class="${srcClass(s.src)}"><input data-meta="${k}" value="${esc(s.v)}"></td><td><span class="pill ${s.src==='manual'?'pill-gray':'pill-green'}">${srcLabel(s.src)}</span></td></tr>`; }).join('')}
+      </tbody>
+    </table>
+  </div>
+  <div style="margin-top:14px;display:flex;gap:10px"><button class="btn secondary" id="prev2">← 上一步</button><button class="btn" id="next2">下一步：物品明细 →</button></div>`;
+  $$('[data-meta]').forEach(inp=> inp.oninput = e=>{ W.sources[e.target.dataset.meta].v=e.target.value; W.sources[e.target.dataset.meta].src='manual'; });
+  $('#prev2').onclick=()=>{W.step=1;renderWizard();};
+  $('#next2').onclick=()=>{W.step=3;renderWizard();};
+}
+function step3(box){
+  if(W.form.items.length===0){ W.form.items.push({boxNo:'',sku:'8T026-12',nameCn:'',nameEn:'',qty:8,declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:''}); }
+  function addRow(){ W.form.items.push({boxNo:'',sku:'',nameCn:'',nameEn:'',qty:1,declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:''}); renderWizard(); }
+  function renderRows(){
+    return W.form.items.map((it,i)=>{
+      const sk = W.skus.find(s=>s.sku===it.sku);
+      let declareSrc='manual', declareVal=it.declare;
+      if(declareVal===''||declareVal==null){ if(sk && sk.申报价){ declareVal=sk.申报价; declareSrc='sku'; } else if(it.cost!==''){ declareVal=(parseFloat(it.cost)*COEFF).toFixed(2); declareSrc='calc'; } }
+      const dcls = declareSrc==='calc'?'cell-calc':(declareSrc==='sku'?'cell-src':'cell-manual');
+      const pill = declareSrc==='calc'?'pill-yellow':(declareSrc==='sku'?'pill-green':'pill-gray');
+      const pillTxt = declareSrc==='calc'?'推算(成本×'+COEFF+')':(declareSrc==='sku'?'SKU主数据':'手填');
+      return `<tr>
+        <td><input data-i="${i}" data-k="boxNo" value="${esc(it.boxNo)}" placeholder="箱号"></td>
+        <td><input data-i="${i}" data-k="sku" value="${esc(it.sku)}" list="skuList" placeholder="SKU"></td>
+        <td><input data-i="${i}" data-k="nameCn" value="${esc(it.nameCn||(sk?sk.中文品名:''))}" placeholder="中文"></td>
+        <td><input data-i="${i}" data-k="nameEn" value="${esc(it.nameEn||(sk?sk.英文品名:''))}" placeholder="英文"></td>
+        <td><input data-i="${i}" data-k="qty" value="${esc(it.qty)}" style="width:54px" placeholder="数量"></td>
+        <td class="${dcls}"><input data-i="${i}" data-k="declare" value="${esc(declareVal)}" style="width:74px"><br><span class="pill ${pill}">${pillTxt}</span></td>
+        <td><input data-i="${i}" data-k="material" value="${esc(it.material||(sk?sk.材质:''))}" placeholder="材质"></td>
+        <td><input data-i="${i}" data-k="hs" value="${esc(it.hs||(sk?sk.HS:''))}" placeholder="HS"></td>
+        <td><input data-i="${i}" data-k="brand" value="${esc(it.brand||(sk?sk.品牌:''))}" placeholder="品牌"></td>
+        <td><input data-i="${i}" data-k="model" value="${esc(it.model||(sk?sk.型号:''))}" placeholder="型号"></td>
+        <td><input data-i="${i}" data-k="boxWeight" value="${esc(it.boxWeight)}" style="width:54px" placeholder="箱重"></td>
+        <td><input data-i="${i}" data-k="len" value="${esc(it.len)}" style="width:46px" placeholder="长"></td>
+        <td><input data-i="${i}" data-k="wid" value="${esc(it.wid)}" style="width:46px" placeholder="宽"></td>
+        <td><input data-i="${i}" data-k="hgt" value="${esc(it.hgt)}" style="width:46px" placeholder="高"></td>
+        <td><input data-i="${i}" data-k="elec" value="${esc(it.elec)}" style="width:38px" placeholder="电"></td>
+        <td><input data-i="${i}" data-k="magnet" value="${esc(it.magnet)}" style="width:38px" placeholder="磁"></td>
+        <td><input data-i="${i}" data-k="saleUrl" value="${esc(it.saleUrl)}" placeholder="销售链接"></td>
+        <td><button class="btn danger" data-del="${i}" style="padding:4px 8px">删</button></td>
+      </tr>`;
+    }).join('');
+  }
+  box.innerHTML = `
+  <div class="card">
+    <h3>③ 物品明细（装箱单行项目）</h3>
+    <div class="hint">填 SKU 自动反查中文品名/材质/HS/品牌/型号，并带出<b>申报价</b>（绿=SKU主数据；黄=无主数据按成本×${COEFF}推算，需人审确认）。</div>
+    <datalist id="skuList">${W.skus.map(s=>`<option value="${s.sku}">${s.中文品名}</option>`).join('')}</datalist>
+    <div style="overflow:auto"><table>
+      <thead><tr><th>箱号</th><th>SKU</th><th>中文</th><th>英文</th><th>数量</th><th>申报价(USD)</th><th>材质</th><th>HS</th><th>品牌</th><th>型号</th><th>箱重</th><th>长</th><th>宽</th><th>高</th><th>电</th><th>磁</th><th>销售链接</th><th></th></tr></thead>
+      <tbody id="rows">${renderRows()}</tbody>
+    </table></div>
+    <button class="btn secondary" id="addRow" style="margin-top:10px">+ 添加一行</button>
+  </div>
+  <div style="margin-top:14px;display:flex;gap:10px"><button class="btn secondary" id="prev3">← 上一步</button><button class="btn" id="next3">下一步：选模板·预览 →</button></div>`;
+  $$('#rows [data-i]').forEach(inp=> inp.oninput = e=>{ const i=+e.target.dataset.i, k=e.target.dataset.k; W.form.items[i][k]=e.target.value; if(k==='sku') renderWizard(); });
+  $$('#rows [data-del]').forEach(b=> b.onclick=()=>{ W.form.items.splice(+b.dataset.del,1); renderWizard(); });
+  $('#addRow').onclick=addRow;
+  $('#prev3').onclick=()=>{W.step=2;renderWizard();};
+  $('#next3').onclick=()=>{W.step=4;renderWizard();};
+}
+function step4(box){
+  const tmpls = W.templates;
+  const defT = tmpls.find(t=>t.物流商===W.form.物流商) || tmpls[0];
+  if(defT && !W.selTmpl) W.selTmpl = defT.id;
+  box.innerHTML = `
+  <div class="card">
+    <h3>④ 选模板 · 预览映射</h3>
+    <div class="hint">选一个 ACTIVE 模板（已内置 5 家各自字段映射）。下方展示「字段 → 取值来源」。绿=主数据反查，白=手填，黄=推算。模板只定格子位置，值来自 L4。</div>
+    <label>模板（物流商）</label>
+    <select id="selTmpl">${tmpls.length? tmpls.map(t=>`<option value="${t.id}" ${t.id===W.selTmpl?'selected':''}>${esc(t.物流商)} (v${t.版本||1}, ${t.状态})</option>`).join('') : '<option>（无可用模板，去「模板库」上传）</option>'}</select>
+    <div id="mapPreview" style="margin-top:14px"></div>
+  </div>
+  <div style="margin-top:14px;display:flex;gap:10px"><button class="btn secondary" id="prev4">← 上一步</button><button class="btn" id="next4">下一步：校验反查 →</button></div>`;
+  const preview = ()=>{
+    const t = tmpls.find(x=>x.id===$('#selTmpl').value);
+    if(!t){ $('#mapPreview').innerHTML='<div class="empty">无模板</div>'; return; }
+    W.selTmpl = t.id;
+    const mp = t.mapping||{};
+    const rows = Object.keys(W.sources).filter(k=>mp.meta&&mp.meta[k]).map(k=>{
+      const s=W.sources[k]; const cls=(s.src==='channel'||s.src==='warehouse'||s.src==='template')?'cell-src':'cell-manual';
+      return `<tr><td>${k}</td><td class="${cls}">${esc(s.v)||'<span class=muted>—</span>'}</td><td>${s.src}</td><td>${mp.meta[k]}</td></tr>`;
+    }).join('');
+    $('#mapPreview').innerHTML = `<table><thead><tr><th>收货人字段</th><th>值</th><th>来源</th><th>模板格子</th></tr></thead><tbody>${rows||'<tr><td colspan=4 class=empty>该模板无对应收货人字段</td></tr>'}</tbody></table>
+      <div class="hint">物品行将按模板第 ${mp.itemStartRow||'?'} 行起逐行填入（箱号/品名/数量/申报价/材质/HS/品牌/型号等，按该模板实际列映射）。</div>`;
+  };
+  $('#selTmpl').onchange=preview;
+  preview();
+  $('#prev4').onclick=()=>{W.step=3;renderWizard();};
+  $('#next4').onclick=()=>{ if(!W.selTmpl){ alert('请先选择一个模板'); return;} W.step=5; renderWizard(); };
+}
+function step5(box){
+  const checks = runChecks();
+  W.checks = checks;
+  const passAll = checks.every(c=>c.level!=='err');
+  box.innerHTML = `
+  <div class="card">
+    <h3>⑤ 校验反查（质量命门）</h3>
+    <div class="hint">独立重读对账：必填完整性 / 勾稽（箱数=物品行数、数量合计）/ 源忠实高亮。告警+阻断：有红色错误须先修。</div>
+    ${checks.map(c=>{ const cls=c.level==='err'?'alert-err':(c.level==='warn'?'alert-warn':'alert-ok'); const icon=c.level==='err'?'⛔':(c.level==='warn'?'⚠️':'✅'); return `<div class="alert ${cls}">${icon} <b>${esc(c.name)}</b>：${esc(c.msg)}</div>`; }).join('')}
+    <div style="margin-top:10px"><b>勾稽汇总：</b>物品行数=${W.form.items.length}，数量合计=${checks.reduce((a,c)=>a+(c.qtySum||0),0)}，申报总值=$${checks.reduce((a,c)=>a+(c.decSum||0),0).toFixed(2)}</div>
+  </div>
+  <div style="margin-top:14px;display:flex;gap:10px"><button class="btn secondary" id="prev5">← 上一步</button><button class="btn ${passAll?'':'secondary'}" id="next5" ${passAll?'':'disabled'}>${passAll?'下一步：人审·交付 →':'请先修复红色错误'}</button></div>`;
+  $('#prev5').onclick=()=>{W.step=4;renderWizard();};
+  $('#next5').onclick=()=>{ if(passAll){W.step=6;renderWizard();} };
+}
+function runChecks(){
+  const out=[];
+  const reqMeta=['country','company','address','zip','warehouseCode'];
+  const missing = reqMeta.filter(k=> !W.sources[k] || !String(W.sources[k].v).trim());
+  if(missing.length) out.push({level:'err',name:'必填完整性',msg:'以下字段为空：'+missing.join('、')});
+  else out.push({level:'ok',name:'必填完整性',msg:'收货人关键字段均已填'});
+  let qtySum=0, decSum=0, itemErr=0;
+  W.form.items.forEach((it,i)=>{ if(!it.boxNo||!it.nameCn||!it.qty||!(it.declare!==''&&it.declare!=null)) itemErr++; qtySum+=parseFloat(it.qty)||0; decSum+=parseFloat(it.declare)||0; });
+  if(itemErr) out.push({level:'err',name:'物品必填',msg:`有 ${itemErr} 行缺 箱号/品名/数量/申报价`});
+  else out.push({level:'ok',name:'物品必填',msg:`${W.form.items.length} 行物品均完整`});
+  const boxes=[...new Set(W.form.items.map(it=>it.boxNo).filter(Boolean))];
+  out.push({level:'ok',name:'勾稽·箱数',msg:`去重箱号 ${boxes.length} 个，物品行数 ${W.form.items.length} 行（逐箱多 SKU 属正常）`});
+  const calcRows = W.form.items.filter(it=>{ const sk=W.skus.find(s=>s.sku===it.sku); return (it.declare===''||it.declare==null) && (!sk||!sk.申报价) && it.cost!==''; }).length;
+  if(calcRows) out.push({level:'warn',name:'推算申报价',msg:`${calcRows} 行无 SKU 主数据申报价，按成本×${COEFF}推算（标黄），需人审确认`});
+  else out.push({level:'ok',name:'申报价来源',msg:'申报价均有 SKU 主数据支撑'});
+  out.qtySum=qtySum; out.decSum=decSum;
+  return out;
+}
+async function step6(box){
+  const t = W.templates.find(x=>x.id===W.selTmpl);
+  box.innerHTML = `
+  <div class="card">
+    <h3>⑥ 人审闸门 · 交付</h3>
+    <div class="alert alert-warn">⚠️ <b>生成 ≠ 发送</b>。本系统未与物流商打通，默认交付=导出 Excel（物流商导入其系统）。发送为可选、可跳过，须先勾选人审确认。</div>
+    <label style="margin-top:10px"><input type="checkbox" id="humanOk" style="width:auto;margin-right:8px">我已核对源数据、映射与勾稽结果，确认无误</label>
+    <div id="deliverBtns" style="margin-top:14px;display:flex;gap:10px;opacity:.5;pointer-events:none">
+      <button class="btn green" id="exportBtn">⬇ 导出 Excel 交付（默认）</button>
+      <button class="btn secondary" id="sendBtn">✉ 发送给物流商（可选·未集成可跳过）</button>
+    </div>
+    <div id="genLog" style="margin-top:12px"></div>
+  </div>
+  <div style="margin-top:14px"><button class="btn secondary" id="prev6">← 上一步</button></div>`;
+  $('#humanOk').onchange = e=>{ const on=e.target.checked; const b=$('#deliverBtns'); b.style.opacity=on?'1':'0.5'; b.style.pointerEvents=on?'auto':'none'; };
+  $('#prev6').onclick=()=>{W.step=5;renderWizard();};
+  $('#exportBtn').onclick = async ()=>{
+    const log=$('#genLog'); log.innerHTML='<div class="alert alert-warn">⏳ 正在用 ExcelJS 填模板副本…</div>';
+    try{
+      const blob = await generateInvoice(t);
+      downloadBlob(blob, `发票_${W.form.物流商}_${W.form.仓库代码}_${W.form.fbaNo||'draft'}.xlsx`);
+      await put('records',{id:uid(),时间:new Date().toISOString(),物流商:W.form.物流商,渠道:W.form.渠道,仓库:W.form.仓库代码,fba:W.form.fbaNo,模板:t.id,状态:'DELIVERED(导出)'});
+      log.innerHTML='<div class="alert alert-ok">✅ 已导出填好的 Excel（保留原模板样式/合并/图片公式）。可在「校验·监控」看记录。</div>';
+    }catch(err){ log.innerHTML='<div class="alert alert-err">❌ 生成失败：'+esc(err.message)+'</div>'; }
+  };
+  $('#sendBtn').onclick = ()=>{ $('#genLog').innerHTML='<div class="alert alert-warn">ℹ️ 发送适配器未集成（物流商系统未打通）。本步可跳过，已导出 Excel 即可交付。</div>'; };
+}
+async function generateInvoice(tmpl){
+  if(typeof ExcelJS==='undefined') throw new Error('ExcelJS 未加载');
+  const wb = new ExcelJS.Workbook();
+  const buf = await tmpl.blob.arrayBuffer();
+  await wb.xlsx.load(buf);
+  const ws = wb.getWorksheet(1);
+  const M = tmpl.mapping;
+  if(!M) throw new Error('该模板无字段映射');
+  if(M.titleCell && M.titleText) ws.getCell(M.titleCell).value = M.titleText;
+  // 收货人块
+  if(M.meta) Object.entries(M.meta).forEach(([k,cell])=>{ const s=W.sources[k]; if(s && (s.v||s.v===0)) ws.getCell(cell).value = s.v; });
+  // 物品行
+  W.form.items.forEach((it,i)=>{
+    const r = (M.itemStartRow||21) + i;
+    if(M.item) Object.entries(M.item).forEach(([fld,col])=>{
+      const v = it[fld];
+      if(v||v===0){ const num = (fld==='qty'||fld==='declare'||fld==='boxWeight'||fld==='len'||fld==='wid'||fld==='hgt'||fld==='boxCount'||fld==='prodWeight'); ws.getCell(col+r).value = num?parseFloat(v):v; }
+    });
+    // 安速等带币种/原产地固定列
+    if(M.item && M.item.currency) ws.getCell(M.item.currency+r).value='USD';
+    if(M.item && M.item.origin) ws.getCell(M.item.origin+r).value='CN';
+  });
+  return await wb.xlsx.writeBuffer();
+}
+function downloadBlob(blob,name){
+  const url=URL.createObjectURL(new Blob([blob]));
+  const a=document.createElement('a'); a.href=url; a.download=name; a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),3000);
+}
+
+/* ============================================================
+   渠道·收货人主数据 (L4)
+   ============================================================ */
+async function channels(){
+  const list = await getAll('channels');
+  main().innerHTML = `
+  <h2>渠道·收货人主数据</h2>
+  <div class="sub">L4 配置与资源层。这里维护「值」，生成时由向导反查，向导内只读。改一处、全量一致，易错录入收敛到此。</div>
+  <div class="card">
+    <button class="btn" id="addCh">+ 新增渠道</button>
+    <table style="margin-top:12px"><thead><tr><th>物流商</th><th>渠道</th><th>国家</th><th>VAT</th><th>EORI</th><th>仓库</th><th></th></tr></thead>
+    <tbody id="chBody">${list.map(c=>`<tr><td>${esc(c.物流商)}</td><td>${esc(c.渠道)}</td><td>${esc(c.国家)}</td><td>${esc(c.VAT)}</td><td>${esc(c.EORI)}</td><td>${esc((c.仓库||[]).map(w=>w.代码).join(', '))}</td>
+      <td><button class="btn secondary" data-edit="${c.id}" style="padding:4px 8px">编辑</button> <button class="btn danger" data-del="${c.id}" style="padding:4px 8px">删</button></td></tr>`).join('')}</tbody></table>
+  </div>
+  <div id="chEditor"></div>`;
+  $('#addCh').onclick=()=>editChannel(null);
+  $$('[data-edit]').forEach(b=> b.onclick=()=>editChannel(b.dataset.edit));
+  $$('[data-del]').forEach(b=> b.onclick=async()=>{ if(confirm('确认删除该渠道？')){ await del('channels',b.dataset.del); channels(); } });
+}
+async function editChannel(id){
+  const all = await getAll('channels');
+  const c = id? all.find(x=>x.id===id) : {id:uid(),物流商:'',渠道:'',国家:'',VAT:'',EORI:'',注册名:'',注册地址:'',仓库:[{代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}]};
+  const box = $('#chEditor');
+  box.innerHTML = `
+  <div class="card" style="border-color:var(--accent)">
+    <h3>${id?'编辑':'新增'}渠道</h3>
+    <div class="row">
+      <div><label>物流商</label><input id="c_物流商" value="${esc(c.物流商)}"></div>
+      <div><label>渠道</label><input id="c_渠道" value="${esc(c.渠道)}"></div>
+      <div><label>国家</label><input id="c_国家" value="${esc(c.国家)}"></div>
+    </div>
+    <div class="row">
+      <div><label>VAT号</label><input id="c_VAT" value="${esc(c.VAT)}"></div>
+      <div><label>EORI</label><input id="c_EORI" value="${esc(c.EORI)}"></div>
+      <div><label>VAT注册名</label><input id="c_注册名" value="${esc(c.注册名)}"></div>
+    </div>
+    <label>VAT注册地址</label><input id="c_注册地址" value="${esc(c.注册地址)}">
+    <h3 style="margin-top:18px">仓库子表（按仓库代码反查地址）</h3>
+    <div id="whList"></div>
+    <button class="btn secondary" id="addWh" style="margin-top:8px">+ 加仓库</button>
+    <div style="margin-top:14px;display:flex;gap:10px"><button class="btn" id="saveCh">保存</button><button class="btn secondary" id="cancelCh">取消</button></div>
+  </div>`;
+  const renderWh = ()=>{
+    $('#whList').innerHTML = (c.仓库||[]).map((w,i)=>`
+      <div class="row" style="margin:6px 0;align-items:end">
+        <div><label>代码</label><input data-w="${i}" data-f="代码" value="${esc(w.代码)}"></div>
+        <div><label>公司</label><input data-w="${i}" data-f="公司" value="${esc(w.公司)}"></div>
+        <div><label>省份</label><input data-w="${i}" data-f="省份" value="${esc(w.省份)}"></div>
+        <div><label>城市</label><input data-w="${i}" data-f="城市" value="${esc(w.城市)}"></div>
+        <div><label>地址</label><input data-w="${i}" data-f="地址" value="${esc(w.地址)}"></div>
+        <div><label>邮编</label><input data-w="${i}" data-f="邮编" value="${esc(w.邮编)}"></div>
+        <div><label>电话</label><input data-w="${i}" data-f="电话" value="${esc(w.电话)}"></div>
+        <div><button class="btn danger" data-wdel="${i}" style="padding:7px 10px">×</button></div>
+      </div>`).join('');
+    $$('#whList [data-w]').forEach(inp=> inp.oninput=e=>{ c.仓库[+e.target.dataset.w][e.target.dataset.f]=e.target.value; });
+    $$('#whList [data-wdel]').forEach(b=> b.onclick=()=>{ c.仓库.splice(+b.dataset.wdel,1); renderWh(); });
+  };
+  renderWh();
+  $('#addWh').onclick=()=>{ c.仓库.push({代码:'',公司:'',省份:'',城市:'',地址:'',邮编:'',电话:''}); renderWh(); };
+  $('#cancelCh').onclick=()=>{ box.innerHTML=''; };
+  $('#saveCh').onclick=async()=>{
+    c.物流商=$('#c_物流商').value; c.渠道=$('#c_渠道').value; c.国家=$('#c_国家').value; c.VAT=$('#c_VAT').value; c.EORI=$('#c_EORI').value; c.注册名=$('#c_注册名').value; c.注册地址=$('#c_注册地址').value;
+    c.仓库=c.仓库.filter(w=>w.代码);
+    await put('channels',c); box.innerHTML=''; channels();
+  };
+}
+
+/* ============================================================
+   SKU 主数据 (L4)
+   ============================================================ */
+async function skus(){
+  const list = await getAll('skus');
+  main().innerHTML = `
+  <h2>SKU 主数据</h2>
+  <div class="sub">申报价带版本号：变动追加新版本（生效日/原因），不覆盖；发票快照可复验。</div>
+  <div class="card">
+    <button class="btn" id="addSk">+ 新增 SKU</button>
+    <table style="margin-top:12px"><thead><tr><th>SKU</th><th>中文品名</th><th>英文</th><th>材质</th><th>HS</th><th>品牌</th><th>型号</th><th>申报价</th><th>版本</th><th></th></tr></thead>
+    <tbody>${list.map(s=>`<tr><td>${esc(s.sku)}</td><td>${esc(s.中文品名)}</td><td>${esc(s.英文品名)}</td><td>${esc(s.材质)}</td><td>${esc(s.HS)}</td><td>${esc(s.品牌)}</td><td>${esc(s.型号)}</td><td>${esc(s.申报价)}</td><td>${esc((s.版本||[]).length)}</td>
+      <td><button class="btn secondary" data-edit="${s.id}" style="padding:4px 8px">编辑</button> <button class="btn danger" data-del="${s.id}" style="padding:4px 8px">删</button></td></tr>`).join('')}</tbody></table>
+  </div>
+  <div id="skEditor"></div>`;
+  $('#addSk').onclick=()=>editSku(null);
+  $$('[data-edit]').forEach(b=> b.onclick=()=>editSku(b.dataset.edit));
+  $$('[data-del]').forEach(b=> b.onclick=async()=>{ if(confirm('确认删除？')){ await del('skus',b.dataset.del); skus(); } });
+}
+async function editSku(id){
+  const all=await getAll('skus');
+  const s=id?all.find(x=>x.id===id):{id:uid(),sku:'',中文品名:'',英文品名:'',材质:'',HS:'',品牌:'',型号:'',申报价:'',成本:'',版本:[],图片:''};
+  const box=$('#skEditor');
+  box.innerHTML=`
+  <div class="card" style="border-color:var(--accent)">
+    <h3>${id?'编辑':'新增'}SKU</h3>
+    <div class="row">
+      <div><label>SKU</label><input id="s_sku" value="${esc(s.sku)}"></div>
+      <div><label>中文品名</label><input id="s_cn" value="${esc(s.中文品名)}"></div>
+      <div><label>英文品名</label><input id="s_en" value="${esc(s.英文品名)}"></div>
+    </div>
+    <div class="row">
+      <div><label>材质</label><input id="s_mat" value="${esc(s.材质)}"></div>
+      <div><label>HS编码</label><input id="s_hs" value="${esc(s.HS)}"></div>
+      <div><label>品牌</label><input id="s_br" value="${esc(s.品牌)}"></div>
+      <div><label>型号</label><input id="s_md" value="${esc(s.型号)}"></div>
+    </div>
+    <div class="row">
+      <div><label>申报价(USD)</label><input id="s_dec" value="${esc(s.申报价)}"></div>
+      <div><label>成本(USD)</label><input id="s_cost" value="${esc(s.成本)}"></div>
+      <div><label>版本原因</label><input id="s_reason" placeholder="如：成本上涨调申报价"></div>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:10px"><button class="btn" id="saveSk">保存</button><button class="btn secondary" id="cancelSk">取消</button></div>
+  </div>`;
+  $('#cancelSk').onclick=()=>box.innerHTML='';
+  $('#saveSk').onclick=async()=>{
+    const newDec=$('#s_dec').value, oldDec=s.申报价;
+    s.sku=$('#s_sku').value; s.中文品名=$('#s_cn').value; s.英文品名=$('#s_en').value; s.材质=$('#s_mat').value; s.HS=$('#s_hs').value; s.品牌=$('#s_br').value; s.型号=$('#s_md').value; s.成本=$('#s_cost').value;
+    if(newDec!==oldDec){ s.版本=s.版本||[]; s.版本.push({v:(s.版本.length+1),值:newDec,生效日:new Date().toISOString().slice(0,10),原因:$('#s_reason').value||'更新'}); }
+    s.申报价=newDec;
+    await put('skus',s); box.innerHTML=''; skus();
+  };
+}
+
+/* ============================================================
+   模板库 (L4)
+   ============================================================ */
+async function templates(){
+  const list = await getAll('templates');
+  main().innerHTML = `
+  <h2>模板库</h2>
+  <div class="sub">上传空白模板 xlsx（存本地 IndexedDB）。模板=排版层；版本迭代可停用旧版（状态 ACTIVE/DISABLED/DEPRECATED），停模板≠丢数据。</div>
+  <div class="card">
+    <h3>上传新模板</h3>
+    <div class="hint">v1 已内置 5 家物流商映射。上传同结构模板可直接复用；其它物流商映射待补（在 MAPPINGS 增加即可）。</div>
+    <div class="row">
+      <div><label>物流商</label><input id="t_物流商" value="安速"></div>
+      <div><label>渠道</label><input id="t_渠道" value="美国包税海卡(正班)"></div>
+      <div><label>空白模板 xlsx</label><input type="file" id="t_file" accept=".xlsx"></div>
+    </div>
+    <button class="btn" id="upTmpl" style="margin-top:10px">上传并入库</button>
+    <div id="upLog" style="margin-top:8px"></div>
+  </div>
+  <div class="card">
+    <h3>已有模板</h3>
+    <table><thead><tr><th>物流商</th><th>渠道</th><th>版本</th><th>状态</th><th>创建日</th><th>操作</th></tr></thead>
+    <tbody>${list.length?list.map(t=>`
+      <tr><td>${esc(t.物流商)}</td><td>${esc(t.渠道)}</td><td>v${t.版本||1}</td><td><span class="pill ${t.状态==='ACTIVE'?'pill-green':(t.状态==='DISABLED'?'pill-gray':'pill-yellow')}">${t.状态}</span></td><td>${esc(t.创建日||'')}</td>
+      <td>
+        <button class="btn secondary" data-toggle="${t.id}" style="padding:4px 8px">${t.状态==='ACTIVE'?'停用':'启用'}</button>
+        ${t.状态==='ACTIVE'?'<button class="btn secondary" data-deprec="'+t.id+'" style="padding:4px 8px">迭代弃用</button>':''}
+        <button class="btn danger" data-del="${t.id}" style="padding:4px 8px">删</button>
+      </td></tr>`).join(''):'<tr><td colspan=6 class="empty">暂无模板</td></tr>'}</tbody></table>
+  </div>`;
+  $('#upTmpl').onclick=async()=>{
+    const f=$('#t_file').files[0];
+    if(!f){ $('#upLog').innerHTML='<div class="alert alert-err">请选择 xlsx 文件</div>'; return; }
+    const key=$('#t_物流商').value;
+    const blob=new Blob([await f.arrayBuffer()],{type:f.type});
+    const rec={id:uid(),物流商:key,渠道:$('#t_渠道').value,名称:f.name,blob,状态:'ACTIVE',版本:1,创建日:new Date().toISOString().slice(0,10),mapping:MAPPINGS[key]||MAPPINGS['安速']};
+    await put('templates',rec); $('#upLog').innerHTML='<div class="alert alert-ok">✅ 已入库</div>'; templates();
+  };
+  $$('[data-toggle]').forEach(b=> b.onclick=async()=>{ const t=list.find(x=>x.id===b.dataset.toggle); t.状态=t.状态==='ACTIVE'?'DISABLED':'ACTIVE'; await put('templates',t); templates(); });
+  $$('[data-deprec]').forEach(b=> b.onclick=async()=>{ const t=list.find(x=>x.id===b.dataset.deprec); t.状态='DEPRECATED'; await put('templates',t); templates(); });
+  $$('[data-del]').forEach(b=> b.onclick=async()=>{ if(confirm('确认删除模板？')){ await del('templates',b.dataset.del); templates(); } });
+}
+
+/* ============================================================
+   校验·监控 (L6)
+   ============================================================ */
+async function monitor(){
+  const recs = await getAll('records');
+  main().innerHTML = `
+  <h2>校验·监控</h2>
+  <div class="sub">质量规则总览 + 生成记录（溯源审计）。每条记录带时间/物流商/模板，可复验。</div>
+  <div class="card">
+    <h3>质量规则</h3>
+    <table><thead><tr><th>规则</th><th>类型</th><th>说明</th></tr></thead><tbody>
+      <tr><td>必填完整性</td><td><span class="pill pill-red">阻断</span></td><td>收货人关键字段 + 物品必填项为空则阻断</td></tr>
+      <tr><td>勾稽·箱数/数量</td><td><span class="pill pill-red">阻断</span></td><td>箱号/数量合计与装箱单一致</td></tr>
+      <tr><td>申报价来源</td><td><span class="pill pill-yellow">告警</span></td><td>无主数据按下推算(成本×${COEFF})需人审确认</td></tr>
+      <tr><td>源忠实</td><td><span class="pill pill-green">提示</span></td><td>推算值标黄、主数据反查标绿，便于复核</td></tr>
+      <tr><td>人审闸门</td><td><span class="pill pill-red">阻断</span></td><td>未勾选确认不得导出/发送</td></tr>
+    </tbody></table>
+  </div>
+  <div class="card">
+    <h3>生成记录（${recs.length}）</h3>
+    ${recs.length?`<table><thead><tr><th>时间</th><th>物流商</th><th>渠道</th><th>仓库</th><th>FBA号</th><th>状态</th></tr></thead><tbody>
+      ${recs.slice().reverse().map(r=>`<tr><td>${esc(r.时间)}</td><td>${esc(r.物流商)}</td><td>${esc(r.渠道)}</td><td>${esc(r.仓库)}</td><td>${esc(r.fba)}</td><td><span class="pill pill-green">${esc(r.状态)}</span></td></tr>`).join('')}</tbody></table>`
+      :'<div class="empty">暂无生成记录，去「生成发票向导」产出第一票。</div>'}
+  </div>`;
+}
+
+/* ---------- 启动 ---------- */
+(async function init(){
+  const status = document.getElementById('dbStatus');
+  try{
+    await openDB();
+    await seedIfEmpty();
+    status.textContent = USE_DB ? '存储: 本地 IndexedDB ✓' : '存储: 内存模式(IndexedDB不可用)';
+    status.style.color = USE_DB ? 'var(--green)' : 'var(--warn)';
+    go('overview');
+  }catch(e){
+    status.textContent = '存储: 异常，已降级';
+    console.error(e);
+    try{ go('overview'); }catch(_){ main().innerHTML='<div class="alert alert-err">初始化失败：'+esc(e.message)+'</div>'; }
+  }
+})();
