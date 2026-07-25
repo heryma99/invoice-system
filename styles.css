@@ -44,6 +44,7 @@ button.btn.green{background:var(--green);color:#06281c}
 button.btn:disabled{opacity:.45;cursor:not-allowed}
 .cell-src{background:rgba(52,211,153,.14)!important}      /* 主数据反查 */
 .cell-manual{background:rgba(255,255,255,.04)!important}  /* 人工填写 */
+.cell-warn{background:rgba(248,113,113,.22)!important;color:var(--danger);border-left:3px solid var(--danger)}  /* 待补/缺失(申报价等无主数据) */
 .cell-calc{background:rgba(251,191,36,.18)!important;color:var(--warn)} /* 推算值 */
 .pill{font-size:11px;padding:2px 7px;border-radius:20px;font-weight:600}
 .pill-green{background:rgba(52,211,153,.2);color:var(--green)}
