@@ -80,3 +80,21 @@ button.btn:disabled{opacity:.45;cursor:not-allowed}
 .kv{width:100%;border-collapse:collapse;font-size:13px;margin:8px 0}
 .kv td{border:1px solid var(--line);padding:6px 10px}
 .kv td:first-child{color:var(--muted);width:170px;background:var(--panel2)}
+
+/* --- Loading 动画 --- */
+.loading-wrap{margin-top:10px;padding:14px;background:var(--panel2);border-radius:10px;border:1px solid var(--line)}
+.loading-header{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.spinner{width:24px;height:24px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loading-title{font-size:14px;font-weight:600;color:var(--txt)}
+.loading-bar-wrap{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-bottom:10px}
+.loading-bar{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:3px;width:0%;transition:width 0.5s ease}
+.loading-steps{display:flex;flex-direction:column;gap:6px}
+.loading-step{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);padding:4px 0}
+.loading-step .dot{width:10px;height:10px;border-radius:50%;border:2px solid var(--line);flex-shrink:0;transition:all 0.3s}
+.loading-step.active{color:var(--txt)}
+.loading-step.active .dot{border-color:var(--accent);background:var(--accent);box-shadow:0 0 6px rgba(79,156,255,.5)}
+.loading-step.done{color:var(--green)}
+.loading-step.done .dot{background:var(--green);border-color:var(--green)}
+.loading-step.fail{color:var(--danger)}
+.loading-step.fail .dot{background:var(--danger);border-color:var(--danger)}
