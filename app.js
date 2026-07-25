@@ -530,7 +530,22 @@ function step3(box){
   if(W.handover){
     const fid = W.packFbaId || W.handover.fba_shipment || W.handover.internal_no;
     const rl=$('#pl_reload'); if(rl) rl.onclick=()=> loadPackingList(fid);
-    const pf=$('#pl_file'); if(pf) pf.onchange=e=>{ const file=e.target.files[0]; if(!file) return; const rd=new FileReader(); rd.onload=()=>{ const items=parsePackingList(rd.result); const msg=$('#pl_msg'); if(items.length){ W.form.items=items; msg.textContent='已上传并填入 '+items.length+' 行。'; renderWizard(); } else msg.textContent='解析为空（请确认是 CSV）。'; }; rd.readAsText(file); };
+    const pf=$('#pl_file'); if(pf) pf.onchange=e=>{
+      const file=e.target.files[0]; if(!file) return;
+      const msg=$('#pl_msg'); msg.textContent='⏳ 正在解析 '+file.name+'...';
+      const isXlsx = /\.(xlsx|xls)$/i.test(file.name);
+      const rd=new FileReader();
+      rd.onload=async()=>{
+        try{
+          let items = isXlsx ? await parsePackingXlsx(rd.result) : parsePackingList(rd.result);
+          if(items.length){ W.form.items=items; msg.textContent='✅ 已上传并填入 '+items.length+' 行（'+file.name+'）。'; renderWizard(); }
+          else msg.textContent='⚠️ 解析为空，请确认文件是有效的装箱清单（Excel xlsx 或 CSV）。';
+        }catch(err){ console.error(err); msg.textContent='❌ 解析失败：'+(err.message||err); }
+      };
+      rd.onerror=()=>{ msg.textContent='❌ 文件读取失败'; };
+      if(isXlsx) rd.readAsArrayBuffer(file); else rd.readAsText(file);
+    };
+    const ob=$('#pl_online'); if(ob) ob.onclick=()=> onlineFetch(fid);
   }
 }
 function packingBannerHTML(){
@@ -549,10 +564,15 @@ function packingBannerHTML(){
   }
   return `
   <div class="card" style="margin-top:10px;border-color:#c53030">
-    <div class="hint warn">⚠️ 本地未收录该货件（${esc(fid)}）的装箱清单内容。请上传装箱清单 CSV（Excel 请先另存为 CSV）：</div>
-    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <label class="btn secondary" style="margin:0">上传装箱清单 CSV<input type="file" id="pl_file" accept=".csv" style="display:none"></label>
-      <span id="pl_msg" class="muted"></span>
+    <div class="hint warn">⚠️ 本地未收录该货件（${esc(fid)}）的装箱清单内容。下方两个按钮：</div>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:10px">
+      <label class="btn" id="pl_upload_btn" style="margin:0;font-size:15px;padding:10px 20px;background:#2b6cb0;color:#fff"><span style="font-size:17px;margin-right:6px">📤</span>上传装箱清单（Excel / CSV）<input type="file" id="pl_file" accept=".xlsx,.xls,.csv" style="display:none"></label>
+      <button class="btn" id="pl_online" style="font-size:15px;padding:10px 20px;background:#38a169;color:#fff"><span style="font-size:17px;margin-right:6px">🌐</span>在线获取</button>
+      <span id="pl_msg" class="muted" style="flex:1;min-width:200px"></span>
+    </div>
+    <div class="hint" style="margin-top:10px;font-size:12px;color:#888">
+      <b>上传</b>：直接选本机的 xlsx/xls/csv 装箱清单（无需另存为 CSV）。<br>
+      <b>在线获取</b>：①系统已收录该货件号 → 秒级自动填入；②未收录 → 把云盘链接或货件号发我，我用 lark-cli 5 分钟内烘焙进系统。
     </div>
   </div>`;
 }
@@ -578,6 +598,121 @@ function parsePackingList(text){
   }
   return out;
 }
+
+/* 在线获取：检查系统是否已预装该货件的装箱清单,有则秒填,无则提示用户上传或让 agent 拉取 */
+function onlineFetch(fid){
+  const msg=$('#pl_msg'); if(!msg) return;
+  const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
+  if(pl.length){
+    W.form.items = pl.map(x=>Object.assign({}, x));
+    msg.textContent='✅ 已从系统预装的装箱清单自动填入 '+pl.length+' 行（货件 '+fid+'）。';
+    renderWizard();
+  } else {
+    msg.innerHTML = '⚠️ 货件号 <b>'+esc(fid)+'</b> 暂未预装。纯前端架构无法直连飞书云文档，请二选一：<br>① 直接点「📤 上传装箱清单」选本机的 xlsx；② 把云盘链接/货件号发我，<b>5 分钟内</b>我用 lark-cli 拉取并烘焙进系统（后续该货件点「在线获取」即可秒填）。';
+  }
+}
+
+/* 解析 Excel xlsx 装箱清单：用 ExcelJS 读，支持亚马逊 ONE_SKU 导出(格式A,按箱号/箱子名称区间展开)和通用按箱展开格式 */
+async function parsePackingXlsx(arrayBuffer){
+  if(typeof ExcelJS==='undefined') throw new Error('ExcelJS 未加载');
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(arrayBuffer);
+  const ws = wb.worksheets[0];
+  if(!ws) return [];
+  const headerRow = ws.getRow(1);
+  const headers = [];
+  for(let c=1;c<=Math.max(headerRow.cellCount,30);c++) headers.push(String(headerRow.getCell(c).value||'').trim());
+  const lower = headers.map(h=>h.toLowerCase());
+
+  // 列模糊匹配(中英文 + 常见别名)
+  const findCol=(cands)=>{ for(const k of cands){ const i=lower.findIndex(h=>h===k||h.includes(k)); if(i>=0) return i+1; } return 0; };
+  const col={
+    seq: findCol(['序号','seq','no.','no']),
+    sku: findCol(['sku','msku']),
+    fnsku: findCol(['fnsku']),
+    nameCn: findCol(['申报中文名','中文品名','中文名称','品名','中文','名称']),
+    nameEn: findCol(['英文品名','英文名称','英文','nameen','english']),
+    qty: findCol(['发货量','已装量','数量','qty','quantity']),
+    qtyPerBox: findCol(['单箱数量','每箱数量']),
+    boxes: findCol(['箱数','boxes','箱数']),
+    boxSpec: findCol(['箱子型号','箱规','boxspec']),
+    boxWeight: findCol(['箱子毛重','箱重','重量','weight']),
+    len: findCol(['长','length','l']),
+    wid: findCol(['宽','width','w']),
+    hgt: findCol(['高','height','h']),
+    boxNo: findCol(['箱号','boxno','box no','箱号(fba)']),
+    boxLabel: findCol(['箱子名称','箱标签','boxlabel'])
+  };
+
+  // 亚马逊 ONE_SKU 格式 A 检测:有"序号"+"箱子名称"+"单箱数量"
+  const isAmazon = col.seq>0 && col.boxLabel>0 && col.qtyPerBox>0;
+
+  const out=[];
+  const getStr=(row,c)=> c>0 ? String(row.getCell(c).value||'').trim() : '';
+  const getNum=(row,c)=> c>0 ? (parseFloat(row.getCell(c).value)||'') : '';
+
+  // 解析箱号区间: "FBA19J6FCXNKU000001～2；" -> ["FBA19J6FCXNKU000001","FBA19J6FCXNKU000002"]
+  const parseBoxRange=(str)=>{
+    str=str.replace(/[；;]$/,'').trim();
+    const m=str.match(/^(.+?)(\d+)～(\d+)$/);
+    if(m){
+      const prefix=m[1], start=parseInt(m[2]), end=parseInt(m[3]);
+      const pad=m[2].length;
+      const arr=[]; for(let i=start;i<=end;i++) arr.push(prefix+String(i).padStart(pad,'0'));
+      return arr;
+    }
+    return [str];
+  };
+  // 解析箱标签区间: "P2 - B1～B2" -> ["P2 - B1","P2 - B2"]
+  const parseLabelRange=(str)=>{
+    if(!str||!str.includes('～')) return [str];
+    const [a,b]=str.split('～');
+    const m=a.match(/^(.+\D)(\d+)$/);
+    if(!m) return [str];
+    const base=m[1], start=parseInt(m[2]), end=parseInt(b);
+    const pad=m[2].length;
+    const arr=[]; for(let i=start;i<=end;i++) arr.push(base+String(i).padStart(pad,'0'));
+    return arr;
+  };
+
+  for(let r=2;r<=ws.rowCount;r++){
+    const row=ws.getRow(r);
+    const sku=getStr(row,col.sku);
+    if(!sku && !col.boxNo) continue;
+    const base={
+      sku, fnsku: getStr(row,col.fnsku),
+      nameCn: getStr(row,col.nameCn), nameEn: getStr(row,col.nameEn),
+      material:'', hs:'', brand:'JW PEI', model:sku,
+      boxSpec: getStr(row,col.boxSpec),
+      boxWeight: getNum(row,col.boxWeight),
+      len: getNum(row,col.len), wid: getNum(row,col.wid), hgt: getNum(row,col.hgt),
+      declare:'', elec:'N', magnet:'N', saleUrl:'', cost:''
+    };
+    if(isAmazon){
+      const qtyPerBox = parseFloat(getStr(row,col.qtyPerBox))||0;
+      const boxNos = parseBoxRange(getStr(row,col.boxNo));
+      const boxLabels = parseLabelRange(getStr(row,col.boxLabel));
+      for(let k=0;k<boxNos.length;k++){
+        out.push({...base, boxNo:boxNos[k], boxLabel:boxLabels[k]||'', qty:qtyPerBox});
+      }
+    } else {
+      const qty = parseFloat(getStr(row,col.qty))||1;
+      out.push({...base, boxNo: getStr(row,col.boxNo), boxLabel: getStr(row,col.boxLabel), qty});
+    }
+  }
+  // 同步本地主数据(品名/HS/申报价/箱规格反查)
+  try{
+    const norm=s=>(s||'').replace(/@us$/i,'').trim();
+    for(const it of out){
+      const sk=(W.skus||[]).find(x=>x.sku===it.sku);
+      if(sk){ it.nameCn = it.nameCn || sk.中文品名; it.nameEn = it.nameEn || sk.英文品名; it.hs = it.hs || sk.HS; it.material = it.material || sk.材质; it.declare = it.declare || sk.申报价; }
+      const bs=(W.boxspecs||[]).find(x=>norm(x.sku)===norm(it.sku));
+      if(bs){ it.boxSpec = it.boxSpec || bs.model; if(!it.boxWeight) it.boxWeight = bs.weight; if(!it.len) it.len = bs.l; if(!it.wid) it.wid = bs.w; if(!it.hgt) it.hgt = bs.h; }
+    }
+  }catch(e){ console.warn('parsePackingXlsx 主数据同步跳过:', e); }
+  return out;
+}
+
 function step4(box){
   const tmpls = W.templates;
   const defT = tmpls.find(t=>t.物流商===W.form.物流商) || tmpls[0];
