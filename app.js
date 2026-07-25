@@ -243,6 +243,27 @@ async function seedIfEmpty(){
 }
 const COEFF = 0.3; // 推算系数: 申报价 = 成本 × 系数(标黄)
 
+/* ---------- 后端代理状态检测 ---------- */
+async function checkBackend(){
+  const el=$('#backendStatus'); if(!el) return;
+  const url = localStorage.getItem('backend_url') || 'http://localhost:3456';
+  try{
+    const r=await fetch(url+'/api/health', {signal:AbortSignal.timeout(3000)});
+    const d=await r.json();
+    if(d.ok){ el.textContent='后端: 已连接'; el.style.borderColor='var(--green)'; el.style.color='var(--green)'; }
+    else throw new Error('not ok');
+  }catch(e){
+    el.textContent='后端: 未连接 (点击配置)'; el.style.borderColor='var(--warn)'; el.style.color='var(--warn)';
+  }
+  el.style.cursor='pointer';
+  el.title='点击配置后端地址';
+}
+setTimeout(()=>{ checkBackend(); $('#backendStatus').onclick=()=>{
+  const cur=localStorage.getItem('backend_url')||'http://localhost:3456';
+  const v=prompt('请输入后端代理地址：\n(localhost:3456 = 本机, https://xxx.loca.lt = 公网隧道)', cur);
+  if(v&&v.trim()){ localStorage.setItem('backend_url', v.trim()); checkBackend(); }
+}; }, 500);
+
 /* ---------- 工具 ---------- */
 const $ = (s,el=document)=>el.querySelector(s);
 const $$ = (s,el=document)=>[...el.querySelectorAll(s)];
