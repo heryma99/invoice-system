@@ -6,7 +6,7 @@
 'use strict';
 
 /* ---------- 存储层：IndexedDB，不可用时降级为内存(保证不空白) ---------- */
-const DB_NAME = 'invoice_sys_v1', DB_VER = 2;
+const DB_NAME = 'invoice_sys_v1', DB_VER = 3;
 let DB = null, USE_DB = true;
 const mem = { channels:[], skus:[], templates:[], records:[], warehouses:[] };
 function openDB(){
@@ -15,7 +15,7 @@ function openDB(){
       const r = indexedDB.open(DB_NAME, DB_VER);
       r.onupgradeneeded = e=>{
         const db = e.target.result;
-        ['channels','skus','templates','records','warehouses'].forEach(s=>{ if(!db.objectStoreNames.contains(s)) db.createObjectStore(s,{keyPath:'id'}); });
+        ['channels','skus','templates','records','warehouses','boxspecs'].forEach(s=>{ if(!db.objectStoreNames.contains(s)) db.createObjectStore(s,{keyPath:'id'}); });
       };
       r.onsuccess = e=>{ DB=e.target.result; res(DB); };
       r.onerror = ()=>{ USE_DB=false; res(); };
@@ -900,6 +900,14 @@ async function monitor(){
   }catch(e){
     status.textContent = '存储: 异常，已降级';
     console.error(e);
-    try{ go('overview'); }catch(_){ main().innerHTML='<div class="alert alert-err">初始化失败：'+esc(e.message)+'</div>'; }
+    try{ go('overview'); }catch(_){}
+    // 兜底：保证 main 永不空白（即使 overview 也抛错也能看到具体异常）
+    if(main() && !main().innerHTML){
+      main().innerHTML = '<div class="alert alert-err" style="margin:20px"><b>⚠️ 初始化异常，已降级运行</b><br>'+
+        '<pre style="white-space:pre-wrap;color:#ff9;background:#222;padding:8px;margin-top:8px;border-radius:4px">'+
+        esc((e&&e.stack)?e.stack+'\n\n[name:'+e.name+', message:'+e.message+']':String(e))+
+        '</pre>'+
+        '<div style="margin-top:10px;color:#bbb">常见原因：浏览器隐私模式禁用 IndexedDB / 旧版本 store schema 不兼容。请按 <b>Ctrl+Shift+R</b> 硬刷新一次；仍不行请打开开发者工具 (F12) 把 Console 错误发我。</div></div>';
+    }
   }
 })();
