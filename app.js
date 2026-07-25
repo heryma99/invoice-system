@@ -219,6 +219,16 @@ async function seedIfEmpty(){
     for(const s of (window.SKUS||[])){ await put('skus', s); }
     try { localStorage.setItem('skus_seeded_ver', String(SKUS_SEED_VER)); } catch(e){}
   }
+  // 箱型规格主数据：从烘焙的 window.BOX_SPECS(「SKU纸箱规格」飞书表同步) seed
+  const BOXSPEC_SEED_VER = 1;
+  let bsSeeded = false;
+  try { bsSeeded = localStorage.getItem('boxspecs_seeded_ver') === String(BOXSPEC_SEED_VER); } catch(e){}
+  if(!bsSeeded){
+    await clear('boxspecs');
+    const specs = window.BOX_SPECS || {};
+    for(const b of Object.values(specs)){ await put('boxspecs', b); }
+    try { localStorage.setItem('boxspecs_seeded_ver', String(BOXSPEC_SEED_VER)); } catch(e){}
+  }
   // 预置 5 家模板（同目录 fetch，仅 http 下可用；file:// 失败则手动上传）
   // 改为"按缺失补全"：避免旧版残留(空/失败记录)导致新模板永远拉不下来。
   const tmpls = await getAll('templates');
@@ -291,7 +301,7 @@ async function wizard(){
   const channels = await getAll('channels');
   const skus = await getAll('skus');
   const templates = (await getAll('templates')).filter(t=>t.状态!=='DISABLED');
-  W = { step:1, channels, skus, templates, mode:'forward', handover:null,
+  W = { step:1, channels, skus, boxspecs: await getAll('boxspecs'), templates, mode:'forward', handover:null,
         form:{ 物流商:'安速', 渠道:'美国包税-空派(普货)', 仓库代码:'SCK8', fbaNo:'', amazonRef:'', customs:'否', customInfo:'', items:[] },
         sources:{}, checks:null };
   renderWizard();
@@ -468,6 +478,8 @@ function step3(box){
   function renderRows(){
     return W.form.items.map((it,i)=>{
       const sk = W.skus.find(s=>s.sku===it.sku);
+      const normSku = s=>(s||'').replace(/@us$/i,'').trim();
+      const bs = W.boxspecs.find(b=>normSku(b.sku)===normSku(it.sku)) || null;
       let declareSrc='manual', declareVal=it.declare;
       if(declareVal===''||declareVal==null){ if(sk && sk.申报价){ declareVal=sk.申报价; declareSrc='sku'; } else if(it.cost!==''){ declareVal=(parseFloat(it.cost)*COEFF).toFixed(2); declareSrc='calc'; } }
       const dcls = declareSrc==='calc'?'cell-calc':(declareSrc==='sku'?'cell-src':'cell-manual');
@@ -485,11 +497,11 @@ function step3(box){
         <td><input data-i="${i}" data-k="brand" value="${esc(it.brand||(sk?sk.品牌:''))}" placeholder="品牌"></td>
         <td><input data-i="${i}" data-k="model" value="${esc(it.model||(sk?sk.型号:''))}" placeholder="型号"></td>
         <td><input data-i="${i}" data-k="boxes" value="${esc(it.boxes)}" style="width:46px" placeholder="箱数"></td>
-        <td><input data-i="${i}" data-k="boxSpec" value="${esc(it.boxSpec)}" placeholder="箱规"></td>
-        <td><input data-i="${i}" data-k="boxWeight" value="${esc(it.boxWeight)}" style="width:54px" placeholder="箱重"></td>
-        <td><input data-i="${i}" data-k="len" value="${esc(it.len)}" style="width:46px" placeholder="长"></td>
-        <td><input data-i="${i}" data-k="wid" value="${esc(it.wid)}" style="width:46px" placeholder="宽"></td>
-        <td><input data-i="${i}" data-k="hgt" value="${esc(it.hgt)}" style="width:46px" placeholder="高"></td>
+        <td class="${(!it.boxSpec||it.boxSpec==='')&&bs&&bs.model?'cell-src':''}"><input data-i="${i}" data-k="boxSpec" value="${esc((!it.boxSpec||it.boxSpec==='')&&bs&&bs.model?bs.model:it.boxSpec)}" placeholder="箱规"></td>
+        <td class="${(!it.boxWeight||it.boxWeight==='')&&bs&&(bs.weight!=null)?'cell-src':''}"><input data-i="${i}" data-k="boxWeight" value="${esc((!it.boxWeight||it.boxWeight==='')&&bs&&(bs.weight!=null)?bs.weight:it.boxWeight)}" style="width:54px" placeholder="箱重"></td>
+        <td class="${(!it.len||it.len==='**')&&bs&&bs.l?'cell-src':''}"><input data-i="${i}" data-k="len" value="${esc((!it.len||it.len==='**')&&bs&&bs.l?bs.l:it.len)}" style="width:46px" placeholder="长"></td>
+        <td class="${(!it.wid||it.wid==='**')&&bs&&bs.w?'cell-src':''}"><input data-i="${i}" data-k="wid" value="${esc((!it.wid||it.wid==='**')&&bs&&bs.w?bs.w:it.wid)}" style="width:46px" placeholder="宽"></td>
+        <td class="${(!it.hgt||it.hgt==='**')&&bs&&bs.h?'cell-src':''}"><input data-i="${i}" data-k="hgt" value="${esc((!it.hgt||it.hgt==='**')&&bs&&bs.h?bs.h:it.hgt)}" style="width:46px" placeholder="高"></td>
         <td><input data-i="${i}" data-k="elec" value="${esc(it.elec)}" style="width:38px" placeholder="电"></td>
         <td><input data-i="${i}" data-k="magnet" value="${esc(it.magnet)}" style="width:38px" placeholder="磁"></td>
         <td><input data-i="${i}" data-k="saleUrl" value="${esc(it.saleUrl)}" placeholder="销售链接"></td>
