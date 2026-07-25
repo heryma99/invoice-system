@@ -388,7 +388,7 @@ function bindReverse(){
     const all=window.HANDOVER_INDEX||[];
     const hits=all.filter(r=> (r.internal_no&&r.internal_no.toLowerCase().includes(key)) || (r.fba_shipment&&r.fba_shipment.toLowerCase().includes(key)) ).slice(0,30);
     if(hits.length===0){ res.innerHTML='<div class="hint">未找到匹配。可检查单号，或切回「正着填」，或先执行数据同步。</div>'; return; }
-    res.innerHTML = hits.map((r,i)=>`<div class="rev-item" data-i="${i}"><span><b>${esc(r.internal_no||'(无内部单号)')}</b> / ${esc(r.fba_shipment||'(无FBA号)')}</span><span class="muted">${esc(r.物流商||'?')} · ${esc(r.country||'?')} · ${esc(r.boxes||'?')}箱 · ${esc(r.packing_list||'无装箱清单')}</span></div>`).join('');
+    res.innerHTML = hits.map((r,i)=>`<div class="rev-item" data-i="${i}"><span><b>${esc(r.internal_no||'(无内部单号)')}</b> / ${esc(r.fba_shipment||'(无FBA号)')}</span><span class="muted">${esc(r.carrier||r.物流商||'?')} · ${esc(r.country||'?')} · ${esc(r.boxes||'?')}箱 · ${esc(r.packing_list||'无装箱清单')}</span></div>`).join('');
     res.querySelectorAll('.rev-item').forEach(el=> el.onclick=()=> showConfirm(hits[+el.dataset.i]) );
   };
 }
@@ -400,7 +400,7 @@ function showConfirm(r){
       <table class="kv">
         <tr><td>内部单号</td><td>${esc(r.internal_no)}</td></tr>
         <tr><td>FBA货件号</td><td>${esc(r.fba_shipment)}</td></tr>
-        <tr><td>物流商</td><td>${esc(r.物流商)}</td></tr>
+        <tr><td>物流商</td><td>${esc(r.carrier||r.物流商)}</td></tr>
         <tr><td>国家</td><td>${esc(r.country)}</td></tr>
         <tr><td>空/海运</td><td>${esc(r.air_sea)}</td></tr>
         <tr><td>箱数</td><td>${esc(r.boxes)}</td></tr>
@@ -420,7 +420,7 @@ function showConfirm(r){
 function applyHandover(r){
   const f=W.form; W.handover=r;
   f.fbaNo = r.fba_shipment || r.internal_no;
-  if(r.物流商 && W.channels.some(c=>c.物流商===r.物流商)) f.物流商=r.物流商;
+  if((r.carrier||r.物流商) && W.channels.some(c=>c.物流商===(r.carrier||r.物流商))) f.物流商=r.carrier||r.物流商;
   const sameCarrier = W.channels.filter(c=>c.物流商===f.物流商);
   const byCountry = sameCarrier.find(c=>c.国家 && r.country && c.国家.includes(r.country));
   f.渠道 = (byCountry||sameCarrier[0]||{渠道:f.渠道}).渠道;
