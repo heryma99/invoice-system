@@ -410,6 +410,12 @@ function applyHandover(r){
   const whByC = { '美国':'SCK8', '沙特':'RUH8' };
   if(whByC[r.country]) f.仓库代码=whByC[r.country];
   f.customInfo = r.invoice_drop || f.customInfo;
+  // 倒填核心：按货件号从已烘焙的装箱清单一次性拉箱内容，自动填入物品（点一下自动填充）
+  const fid = r.fba_shipment || r.internal_no;
+  W.packFbaId = fid;
+  const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
+  if(pl.length){ W.form.items = pl.map(x=>Object.assign({}, x)); W.plAutoFilled = pl.length; }
+  else { W.plAutoFilled = 0; }
   W.step=2; renderWizard();
 }
 function warehouseOptions(f){
@@ -451,7 +457,7 @@ async function step2(box){
 }
 function step3(box){
   if(W.form.items.length===0){ W.form.items.push({boxNo:'',sku:'8T026-12',nameCn:'',nameEn:'',qty:8,declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:''}); }
-  function addRow(){ W.form.items.push({boxNo:'',sku:'',nameCn:'',nameEn:'',qty:1,declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:''}); renderWizard(); }
+  function addRow(){ W.form.items.push({boxNo:'',sku:'',nameCn:'',nameEn:'',qty:1,declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:'',boxes:'',boxSpec:''}); renderWizard(); }
   function renderRows(){
     return W.form.items.map((it,i)=>{
       const sk = W.skus.find(s=>s.sku===it.sku);
@@ -471,6 +477,8 @@ function step3(box){
         <td><input data-i="${i}" data-k="hs" value="${esc(it.hs||(sk?sk.HS:''))}" placeholder="HS"></td>
         <td><input data-i="${i}" data-k="brand" value="${esc(it.brand||(sk?sk.品牌:''))}" placeholder="品牌"></td>
         <td><input data-i="${i}" data-k="model" value="${esc(it.model||(sk?sk.型号:''))}" placeholder="型号"></td>
+        <td><input data-i="${i}" data-k="boxes" value="${esc(it.boxes)}" style="width:46px" placeholder="箱数"></td>
+        <td><input data-i="${i}" data-k="boxSpec" value="${esc(it.boxSpec)}" placeholder="箱规"></td>
         <td><input data-i="${i}" data-k="boxWeight" value="${esc(it.boxWeight)}" style="width:54px" placeholder="箱重"></td>
         <td><input data-i="${i}" data-k="len" value="${esc(it.len)}" style="width:46px" placeholder="长"></td>
         <td><input data-i="${i}" data-k="wid" value="${esc(it.wid)}" style="width:46px" placeholder="宽"></td>
@@ -487,9 +495,9 @@ function step3(box){
     <h3>③ 物品明细（装箱单行项目）</h3>
     <div class="hint">填 SKU 自动反查中文品名/材质/HS/品牌/型号，并带出<b>申报价</b>（绿=SKU主数据；黄=无主数据按成本×${COEFF}推算，需人审确认）。</div>
     <datalist id="skuList">${W.skus.map(s=>`<option value="${s.sku}">${s.中文品名}</option>`).join('')}</datalist>
-    ${ W.handover && W.handover.packing_list ? packingBannerHTML(W.handover.packing_list) : '' }
+    ${ W.handover ? packingBannerHTML() : '' }
     <div style="overflow:auto"><table>
-      <thead><tr><th>箱号</th><th>SKU</th><th>中文</th><th>英文</th><th>数量</th><th>申报价(USD)</th><th>材质</th><th>HS</th><th>品牌</th><th>型号</th><th>箱重</th><th>长</th><th>宽</th><th>高</th><th>电</th><th>磁</th><th>销售链接</th><th></th></tr></thead>
+      <thead><tr><th>箱号</th><th>SKU</th><th>中文</th><th>英文</th><th>数量</th><th>申报价(USD)</th><th>材质</th><th>HS</th><th>品牌</th><th>型号</th><th>箱数</th><th>箱规</th><th>箱重</th><th>长</th><th>宽</th><th>高</th><th>电</th><th>磁</th><th>销售链接</th><th></th></tr></thead>
       <tbody id="rows">${renderRows()}</tbody>
     </table></div>
     <button class="btn secondary" id="addRow" style="margin-top:10px">+ 添加一行</button>
@@ -500,32 +508,39 @@ function step3(box){
   $('#addRow').onclick=addRow;
   $('#prev3').onclick=()=>{W.step=2;renderWizard();};
   $('#next3').onclick=()=>{W.step=4;renderWizard();};
-  if(W.handover && W.handover.packing_list){
-    const pl=$('#pl_load'); if(pl) pl.onclick=()=> loadPackingList(W.handover.packing_list);
-    const pf=$('#pl_file'); if(pf) pf.onchange=e=>{ const file=e.target.files[0]; if(!file) return; const rd=new FileReader(); rd.onload=()=>{ const items=parsePackingList(rd.result); const msg=$('#pl_msg'); if(items.length){ W.form.items=items; msg.textContent='已上传并填入 '+items.length+' 行。'; renderWizard(); } else msg.textContent='解析为空。'; }; rd.readAsText(file); };
+  if(W.handover){
+    const fid = W.packFbaId || W.handover.fba_shipment || W.handover.internal_no;
+    const rl=$('#pl_reload'); if(rl) rl.onclick=()=> loadPackingList(fid);
+    const pf=$('#pl_file'); if(pf) pf.onchange=e=>{ const file=e.target.files[0]; if(!file) return; const rd=new FileReader(); rd.onload=()=>{ const items=parsePackingList(rd.result); const msg=$('#pl_msg'); if(items.length){ W.form.items=items; msg.textContent='已上传并填入 '+items.length+' 行。'; renderWizard(); } else msg.textContent='解析为空（请确认是 CSV）。'; }; rd.readAsText(file); };
   }
 }
-function packingBannerHTML(fn){
+function packingBannerHTML(){
+  const fid = W.packFbaId || (W.handover&&(W.handover.fba_shipment||W.handover.internal_no)) || '';
+  const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
+  const fn = W.handover ? W.handover.packing_list : '';
+  if(pl.length){
+    return `
+    <div class="card" style="margin-top:10px;border-color:#2b6cb0">
+      <div class="hint ok">✅ 已从装箱清单自动填入 <b>${pl.length}</b> 行物品（货件 ${esc(fid)}）。请核对品名/数量/申报价，无误即可继续。</div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="pl_reload">↻ 重新从装箱清单拉取</button>
+        <span class="muted">源：${esc(fn||'(FBA箱唛交接表关联)')}</span>
+      </div>
+    </div>`;
+  }
   return `
-  <div class="card" style="margin-top:10px;border-color:#2b6cb0">
-    <div class="hint ok">检测到该单关联装箱清单：<b>${esc(fn)}</b>（倒填核心：整张装箱内容一次性抓过来）</div>
+  <div class="card" style="margin-top:10px;border-color:#c53030">
+    <div class="hint warn">⚠️ 本地未收录该货件（${esc(fid)}）的装箱清单内容。请上传装箱清单 CSV（Excel 请先另存为 CSV）：</div>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <button class="btn" id="pl_load">← 从装箱清单一键填入物品明细</button>
-      <label class="btn secondary" style="margin:0">或上传装箱清单 CSV<input type="file" id="pl_file" accept=".csv" style="display:none"></label>
+      <label class="btn secondary" style="margin:0">上传装箱清单 CSV<input type="file" id="pl_file" accept=".csv" style="display:none"></label>
       <span id="pl_msg" class="muted"></span>
     </div>
   </div>`;
 }
-async function loadPackingList(fn){
-  const msg=$('#pl_msg');
-  try{
-    const r=await fetch('./packing_lists/'+encodeURIComponent(fn));
-    if(!r.ok){ msg.textContent='本地未同步该装箱清单，请点「上传」或先执行数据同步。'; return; }
-    const text=await r.text();
-    const items=parsePackingList(text);
-    if(items.length){ W.form.items=items; msg.textContent='已填入 '+items.length+' 行（来自装箱清单）。'; renderWizard(); }
-    else { msg.textContent='解析装箱清单为空，请检查文件格式。'; }
-  }catch(e){ msg.textContent='加载失败：'+e.message; }
+function loadPackingList(fid){
+  const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
+  if(pl.length){ W.form.items = pl.map(x=>Object.assign({}, x)); renderWizard(); }
+  else { const m=$('#pl_msg'); if(m) m.textContent='本地未收录该装箱清单，请上传 CSV。'; }
 }
 function parsePackingList(text){
   const lines=text.split(/\r?\n/).filter(l=>l.trim());
