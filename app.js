@@ -482,9 +482,11 @@ function step3(box){
       const bs = W.boxspecs.find(b=>normSku(b.sku)===normSku(it.sku)) || null;
       let declareSrc='manual', declareVal=it.declare;
       if(declareVal===''||declareVal==null){ if(sk && sk.申报价){ declareVal=sk.申报价; declareSrc='sku'; } else if(it.cost!==''){ declareVal=(parseFloat(it.cost)*COEFF).toFixed(2); declareSrc='calc'; } }
-      const dcls = declareSrc==='calc'?'cell-calc':(declareSrc==='sku'?'cell-src':'cell-manual');
-      const pill = declareSrc==='calc'?'pill-yellow':(declareSrc==='sku'?'pill-green':'pill-gray');
-      const pillTxt = declareSrc==='calc'?'推算(成本×'+COEFF+')':(declareSrc==='sku'?'SKU主数据':'手填');
+      let dcls, pill, pillTxt;
+      if(declareSrc==='calc'){ dcls='cell-calc'; pill='pill-yellow'; pillTxt='推算(成本×'+COEFF+')'; }
+      else if(declareSrc==='sku'){ dcls='cell-src'; pill='pill-green'; pillTxt='SKU主数据'; }
+      else if(declareVal!=='' && declareVal!=null){ dcls='cell-manual'; pill='pill-gray'; pillTxt='手填'; }
+      else { dcls='cell-warn'; pill='pill-red'; pillTxt='⚠ 待手填'; }
       return `<tr>
         <td><input data-i="${i}" data-k="boxNo" value="${esc(it.boxNo)}" placeholder="箱号"></td>
         <td><input data-i="${i}" data-k="sku" value="${esc(it.sku)}" list="skuList" placeholder="SKU"></td>
@@ -774,7 +776,7 @@ function runChecks(){
     qtySum+=parseFloat(it.qty)||0;
     decSum+=(parseFloat(effDeclare)||0)*(parseFloat(it.qty)||0);
   });
-  if(itemErr) out.push({level:'err',name:'物品必填',msg:`有 ${itemErr} 行缺 箱号/品名/数量/申报价`});
+  if(itemErr) out.push({level:'err',name:'物品必填',msg:`有 ${itemErr} 行缺字段。商品申报信息表未收录的 SKU 需手填申报价（详见物品表的红色"待手填"标记），或在飞书「商品申报信息」表补充这些 SKU 的成本价后重烤。`});
   else out.push({level:'ok',name:'物品必填',msg:`${W.form.items.length} 行物品均完整`});
   const boxes=[...new Set(W.form.items.map(it=>it.boxNo).filter(Boolean))];
   // qtySum/decSum 挂到该项上,让外层 reduce 能拿到(之前挂在 out 顶层是 bug)
