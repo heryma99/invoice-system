@@ -594,8 +594,9 @@ function packingBannerHTML(){
       <span id="pl_msg" class="muted" style="flex:1;min-width:200px"></span>
     </div>
     <div class="hint" style="margin-top:10px;font-size:12px;color:#888">
-      <b>上传</b>：直接选本机的 xlsx/xls/csv 装箱清单（无需另存为 CSV）。<br>
-      <b>在线获取</b>：①系统已收录该货件号 → 秒级自动填入；②未收录 → 把云盘链接或货件号发我，我用 lark-cli 5 分钟内烘焙进系统。
+      <b>📤 上传</b>：直接选本机的 xlsx/xls/csv 装箱清单（无需另存为 CSV）。<br>
+      <b>🌐 在线获取</b>：①系统已收录该货件号 → 秒级自动填入；②<b>未收录</b> → <b>点击后会自动调后端从飞书云文档拉取</b>。<br>
+      <span style="color:#c53030">⚠️ 后端未启动？</span> 双击 <code>backend\install_autostart.bat</code> 一次性安装开机自启，<b>之后再也不需要管</b>。
     </div>
   </div>`;
 }
@@ -735,9 +736,11 @@ function onlineFetch(fid){
           setBar(100);
           let hint = '';
           if(e.name==='TimeoutError' || e.message.includes('timeout')){
-            hint = '<div class="hint warn" style="margin-top:10px">⏱️ 后端15秒超时未响应（<b>'+esc(backendUrl)+'</b>）。可能是 zombie 进程占用了 3456 端口。<br>① <b>打开任务管理器 → 杀所有 node.exe</b>；<br>② 重新双击 <b>start_backend.bat</b>；<br>③ 然后重试，或点上面「<b>📤 上传装箱清单</b>」选本机 xlsx。</div>';
+            hint = '<div class="hint warn" style="margin-top:10px">⏱️ 后端15秒超时未响应。<br>① <b>双击 <code>backend\\start_backend.bat</code> 启动本地后端</b>（首次需本机 lark-cli 已授权）；<br>② 或运行 <code>backend\\install_autostart.bat</code> 注册开机自启，<b>之后完全不用管</b>；<br>③ 当前货件可直接点「<b>📤 上传装箱清单</b>」选本机 xlsx。</div>';
+          } else if(e.message.includes('Failed to fetch')||e.message.includes('fetch')){
+            hint = '<div class="hint warn" style="margin-top:10px">❌ 浏览器连不上本地后端。<br><b>最简单的解决方案：</b>双击 <code>backend\\install_autostart.bat</code> 注册开机自启，<b>之后什么都不用操作</b>，任何时间打开本页面点「在线获取」就秒响应。</div>';
           } else {
-            hint = '<div class="hint warn" style="margin-top:10px">⚠️ <b>'+esc(fid)+'</b> 后端不可用（'+esc(e.message)+'）。<br>① <b>直接点「📤 上传装箱清单」</b> 选本机 xlsx；<br>② 或打开任务管理器杀 <b>node.exe</b> 后重试。</div>';
+            hint = '<div class="hint warn" style="margin-top:10px">⚠️ <b>'+esc(fid)+'</b> 后端不可用（'+esc(e.message)+'）。<br>① 双击 <code>backend\\start_backend.bat</code> 启动；<br>② 或点「<b>📤 上传装箱清单</b>」选本机 xlsx（<b>已加强解析支持</b>）。</div>';
           }
           done(false, hint);
         });
@@ -768,40 +771,61 @@ async function parsePackingXlsx(arrayBuffer){
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(arrayBuffer);
   const ws = wb.worksheets[0];
-  if(!ws) return [];
-  const headerRow = ws.getRow(1);
-  const headers = [];
-  for(let c=1;c<=Math.max(headerRow.cellCount,30);c++) headers.push(String(headerRow.getCell(c).value||'').trim());
-  const lower = headers.map(h=>h.toLowerCase());
+  if(!ws) throw new Error('Excel文件无工作表');
 
-  // 列模糊匹配(中英文 + 常见别名)
-  const findCol=(cands)=>{ for(const k of cands){ const i=lower.findIndex(h=>h===k||h.includes(k)); if(i>=0) return i+1; } return 0; };
+  // 1. 扫描前10行,找到真正的表头行（包含"SKU"+"数量/箱数"或"MSKU"+"FNSKU"）
+  let headerRow = 1;
+  let headerStr = '';
+  for(let r=1;r<=Math.min(ws.rowCount,10);r++){
+    const row=ws.getRow(r);
+    let txt=''; for(let c=1;c<=row.cellCount;c++) txt += String(row.getCell(c).value||'')+'|';
+    const low=txt.toLowerCase();
+    // 检测多种表头模式
+    if((low.includes('sku')||low.includes('msku')) &&
+       (low.includes('数量')||low.includes('qty')||low.includes('件数')||low.includes('箱数'))){
+      headerRow=r; headerStr=txt; break;
+    }
+  }
+
+  // 2. 读表头
+  const hdr=ws.getRow(headerRow);
+  const headers=[]; for(let c=1;c<=Math.max(hdr.cellCount,30);c++) headers.push(String(hdr.getCell(c).value||'').trim());
+  const lower=headers.map(h=>h.toLowerCase());
+
+  const findCol=cands=>{const i=lower.findIndex(h=>cands.some(k=>h===k||h.includes(k))); return i>=0?i+1:0;};
   const col={
-    seq: findCol(['序号','seq','no.','no']),
-    sku: findCol(['sku','msku']),
+    sku: findCol(['msku','sku','型号','产品型号']),
     fnsku: findCol(['fnsku']),
     nameCn: findCol(['申报中文名','中文品名','中文名称','品名','中文','名称']),
-    nameEn: findCol(['英文品名','英文名称','英文','nameen','english']),
-    qty: findCol(['发货量','已装量','数量','qty','quantity']),
-    qtyPerBox: findCol(['单箱数量','每箱数量']),
-    boxes: findCol(['箱数','boxes','箱数']),
-    boxSpec: findCol(['箱子型号','箱规','boxspec']),
-    boxWeight: findCol(['箱子毛重','箱重','重量','weight']),
-    len: findCol(['长','length','l']),
-    wid: findCol(['宽','width','w']),
-    hgt: findCol(['高','height','h']),
-    boxNo: findCol(['箱号','boxno','box no','箱号(fba)']),
-    boxLabel: findCol(['箱子名称','箱标签','boxlabel'])
+    nameEn: findCol(['英文品名','英文名称','商品名称','英文','nameen','english','product name']),
+    qty: findCol(['发货量','已装量','数量','qty','quantity','商品总数']),
+    qtyPerBox: findCol(['单箱数量','每箱数量','每箱件数']),
+    boxes: findCol(['箱子总数','箱数','boxes','ctns','cartons']),
+    boxSpec: findCol(['箱子型号','箱规','boxspec','box spec']),
+    boxWeight: findCol(['箱子毛重','单箱毛重','箱重','重量','weight']),
+    len: findCol(['箱子长度','长','length','l']),
+    wid: findCol(['箱子宽度','宽','width','w']),
+    hgt: findCol(['箱子高度','高','height','h']),
+    boxNo: findCol(['箱号','boxno','box no','fba箱号']),
+    boxLabel: findCol(['箱子名称','箱标签','boxlabel','label']),
+    asin: findCol(['asin']),
+    brand: findCol(['品牌','brand']),
   };
 
-  // 亚马逊 ONE_SKU 格式 A 检测:有"序号"+"箱子名称"+"单箱数量"
-  const isAmazon = col.seq>0 && col.boxLabel>0 && col.qtyPerBox>0;
+  // 3. 格式检测
+  const hasWorkingWorkflow = col.asin>0 && col.boxNo>0 && !col.boxLabel; // 亚马逊"原厂包装发货"格式
+  const hasAmazonOneSKU = col.qtyPerBox>0 && col.boxLabel>0; // 亚马逊 ONE_SKU_NO_PIC
+  const hasGenericFormat = col.sku>0 && col.qty>0;
+
+  if(!col.sku && !col.boxNo){
+    throw new Error(`未识别表头。请确认 Excel 包含 SKU/MSKU/箱号/装箱清单 等列。当前表头: ${headers.slice(0,10).join(', ')}`);
+  }
 
   const out=[];
   const getStr=(row,c)=> c>0 ? String(row.getCell(c).value||'').trim() : '';
   const getNum=(row,c)=> c>0 ? (parseFloat(row.getCell(c).value)||'') : '';
 
-  // 解析箱号区间: "FBA19J6FCXNKU000001～2；" -> ["FBA19J6FCXNKU000001","FBA19J6FCXNKU000002"]
+  // 解析 FBA 箱号区间: "FBA19J6FCXNKU000001～2；" → [箱号1,箱号2]
   const parseBoxRange=(str)=>{
     str=str.replace(/[；;]$/,'').trim();
     const m=str.match(/^(.+?)(\d+)～(\d+)$/);
@@ -811,52 +835,88 @@ async function parsePackingXlsx(arrayBuffer){
       const arr=[]; for(let i=start;i<=end;i++) arr.push(prefix+String(i).padStart(pad,'0'));
       return arr;
     }
-    return [str];
+    return str ? [str] : [];
   };
-  // 解析箱标签区间: "P2 - B1～B2" -> ["P2 - B1","P2 - B2"]
+  // 解析箱标签: "P2 - B1～B2" → [B1,B2]（跳过托盘号）
   const parseLabelRange=(str)=>{
-    if(!str||!str.includes('～')) return [str];
-    const [a,b]=str.split('～');
-    const m=a.match(/^(.+\D)(\d+)$/);
-    if(!m) return [str];
-    const base=m[1], start=parseInt(m[2]), end=parseInt(b);
-    const pad=m[2].length;
-    const arr=[]; for(let i=start;i<=end;i++) arr.push(base+String(i).padStart(pad,'0'));
-    return arr;
+    if(!str) return [];
+    const last = str.includes(' - ') ? str.split(' - ').pop() : str;
+    const m=last.match(/^([A-Za-z]?)(\d+)\s*[～~\-]\s*([A-Za-z]?\d+)$/);
+    if(m){
+      const prefix=m[1]||'B';
+      const start=parseInt(m[2]), end=parseInt(m[3].replace(/^[A-Za-z]/,''));
+      const arr=[]; for(let i=start;i<=end;i++) arr.push(prefix+i);
+      return arr;
+    }
+    if(last.match(/^[A-Za-z]?\d+$/)) return [last];
+    return last ? [last] : [];
   };
 
-  for(let r=2;r<=ws.rowCount;r++){
+  for(let r=headerRow+1;r<=ws.rowCount;r++){
     const row=ws.getRow(r);
+    const vals=[]; for(let c=1;c<=Math.max(row.cellCount,30);c++) vals.push(row.getCell(c).value);
+    // 跳过全空行
+    if(vals.every(v=>v===null||v===undefined||v==='')) continue;
+
     const sku=getStr(row,col.sku);
-    if(!sku && !col.boxNo) continue;
-    const base={
-      sku, fnsku: getStr(row,col.fnsku),
-      nameCn: getStr(row,col.nameCn), nameEn: getStr(row,col.nameEn),
-      material:'', hs:'', brand:'JW PEI', model:sku,
-      boxSpec: getStr(row,col.boxSpec),
-      boxWeight: getNum(row,col.boxWeight),
-      len: getNum(row,col.len), wid: getNum(row,col.wid), hgt: getNum(row,col.hgt),
-      declare:'', elec:'N', magnet:'N', saleUrl:'', cost:''
-    };
-    if(isAmazon){
-      const qtyPerBox = parseFloat(getStr(row,col.qtyPerBox))||0;
-      const boxNos = parseBoxRange(getStr(row,col.boxNo));
-      const boxLabels = parseLabelRange(getStr(row,col.boxLabel));
-      for(let k=0;k<boxNos.length;k++){
-        out.push({...base, boxNo:boxNos[k], boxLabel:boxLabels[k]||'', qty:qtyPerBox});
+    const fnsku=getStr(row,col.fnsku);
+    const nameEn=getStr(row,col.nameEn);
+    const nameCn=getStr(row,col.nameCn);
+    const boxWeight=getNum(row,col.boxWeight);
+    const len=getNum(row,col.len);
+    const wid=getNum(row,col.wid);
+    const hgt=getNum(row,col.hgt);
+
+    const base={sku,fnsku,nameCn,nameEn,brand:getStr(row,col.brand)||'JW PEI',boxSpec:getStr(row,col.boxSpec),boxWeight,len,wid,hgt,material:'',hs:'',model:sku,elec:'N',magnet:'N',saleUrl:'',declare:'',cost:''};
+
+    if(hasAmazonOneSKU){
+      // 亚马逊 ONE_SKU_NO_PIC 格式: 一行一个SKU, 展开多箱
+      const qtyPerBox=parseFloat(getStr(row,col.qtyPerBox))||0;
+      const boxNos=parseBoxRange(getStr(row,col.boxNo));
+      const boxLabels=parseLabelRange(getStr(row,col.boxLabel));
+      const count=Math.max(boxNos.length, boxLabels.length, parseInt(getStr(row,col.boxes))||1);
+      for(let k=0;k<count;k++){
+        const item={...base, boxNo:boxNos[k]||`box${k+1}`, boxLabel:boxLabels[k]||'', qty:qtyPerBox};
+        out.push(item);
+      }
+    } else if(hasWorkingWorkflow){
+      // 亚马逊"原厂包装发货"格式: 行末"箱号"列是逗号分隔的箱号列表
+      const qtyPerBox=parseFloat(getStr(row,col.qtyPerBox))||parseFloat(getStr(row,col.qty))||0;
+      const boxNosStr=getStr(row,col.boxNo);
+      const boxNos=boxNosStr ? boxNosStr.split(',').map(s=>s.trim()).filter(Boolean) : [];
+      if(boxNos.length===0){
+        // 没有箱号就当一行一箱
+        out.push({...base, boxNo:'', boxLabel:'', qty:qtyPerBox||1});
+      } else {
+        for(const bn of boxNos){
+          out.push({...base, boxNo:bn, boxLabel:bn, qty:qtyPerBox});
+        }
       }
     } else {
-      const qty = parseFloat(getStr(row,col.qty))||1;
-      out.push({...base, boxNo: getStr(row,col.boxNo), boxLabel: getStr(row,col.boxLabel), qty});
+      // 通用格式: 一行一箱,或一行多箱
+      const qty=parseFloat(getStr(row,col.qty))||1;
+      const boxNoStr=getStr(row,col.boxNo);
+      // 如果箱号是逗号分隔,也展开
+      if(boxNoStr && boxNoStr.includes(',')){
+        for(const bn of boxNoStr.split(',').map(s=>s.trim()).filter(Boolean)){
+          out.push({...base, boxNo:bn, boxLabel:getStr(row,col.boxLabel), qty});
+        }
+      } else {
+        out.push({...base, boxNo:boxNoStr, boxLabel:getStr(row,col.boxLabel), qty});
+      }
     }
   }
+
+  if(out.length===0){
+    throw new Error('解析后无数据行。请检查 Excel 格式。');
+  }
+
   // 同步本地主数据(品名/HS/申报价/箱规格反查)
   try{
     const norm=s=>(s||'').replace(/@us$/i,'').trim();
     for(const it of out){
       const sk=(W.skus||[]).find(x=>x.sku===it.sku);
       if(sk){ it.nameCn = it.nameCn || sk.中文品名; it.nameEn = it.nameEn || sk.英文品名; it.hs = it.hs || sk.HS; it.material = it.material || sk.材质; it.declare = it.declare || sk.申报价; }
-      // 全量申报价索引兜底（14114 SKU，去前缀后快速 O(1) 查找）
       if((!it.declare||it.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[it.sku]){
         it.declare = window.SKU_DECLARE[it.sku].d;
         if(!it.nameCn) it.nameCn = window.SKU_DECLARE[it.sku].n;
