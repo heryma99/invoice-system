@@ -40,13 +40,38 @@ function clear(store){
   return new Promise((res,rej)=>{ const r=_idb(store,'readwrite').clear(); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); });
 }
 const uid = ()=> Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+/* 把 FBA 货件号 + 箱标（如 B3）拼回 FBA 箱 ID */
+function fbaBoxId(fbaNo, boxLabel){
+  if(!fbaNo || !boxLabel) return boxLabel;
+  const m = String(boxLabel).match(/^([A-Za-z]?)(\d+)$/);
+  if(!m) return boxLabel;
+  const n = parseInt(m[2],10);
+  return fbaNo.replace(/\s+/g,'') + 'U' + String(n).padStart(6,'0');
+}
+function isSimpleLabel(v){ return /^[A-Za-z]?\d+$/.test(String(v||'')); }
+/* 后端/老数据可能只返回 boxNo（且是简单箱标），需补齐 boxLabel 并尝试还原 FBA 箱 ID */
+function normalizeItems(items, fbaNo){
+  return items.map(it=>{
+    const out = {...it};
+    const hasLabel = out.boxLabel && String(out.boxLabel).trim();
+    const hasNo = out.boxNo && String(out.boxNo).trim();
+    if(!hasLabel && hasNo && isSimpleLabel(out.boxNo)) out.boxLabel = out.boxNo;
+    if(!hasNo && hasLabel) out.boxNo = out.boxLabel;
+    // 如果 boxNo 仍是简单箱标而 boxLabel 也是简单箱标，尝试用 FBA 号还原真实 boxNo
+    if(isSimpleLabel(out.boxLabel) && String(out.boxNo)===String(out.boxLabel) && fbaNo){
+      out.boxNo = fbaBoxId(fbaNo, out.boxLabel);
+    }
+    return out;
+  });
+}
 
 /* ---------- 5 家物流商模板字段映射(由 inspect_all.js 解析得到) ---------- */
 const MAPPINGS = {
   '安速':{
     titleCell:'A1', titleText:'FBA订单（V3）',
     meta:{ fbaNo:'D2', amazonRef:'D4', shipMethod:'D3', warehouseCode:'D5', company:'E6', country:'D7', province:'D8', city:'D9', address:'D10', phone:'D11', zip:'D12', email:'E13', customs:'D14', vat:'E15', eori:'E16', vatName:'E17', vatAddr:'E18', customInfo:'E19' },
-    item:{ boxNo:'A', nameCn:'G', nameEn:'H', qty:'I', declare:'K', material:'M', hs:'L', brand:'V', model:'W', boxWeight:'C', len:'D', wid:'E', hgt:'F', elec:'O', magnet:'P', img:'Q', imgUrl:'R', salePrice:'S', saleUrl:'T', currency:'Z', origin:'AA' },
+    // 模板列：A=No.of Pkgs(箱号)=boxLabel, B=子单号(同箱号)=boxNo(FBA箱ID)
+    item:{ boxLabel:'A', boxNo:'B', nameCn:'G', nameEn:'H', qty:'I', declare:'K', material:'M', hs:'L', brand:'V', model:'W', boxWeight:'C', len:'D', wid:'E', hgt:'F', elec:'O', magnet:'P', img:'Q', imgUrl:'R', salePrice:'S', saleUrl:'T', currency:'Z', origin:'AA' },
     itemStartRow:21
   },
   '艾杜克':{
@@ -513,8 +538,8 @@ async function step2(box){
   $('#next2').onclick=()=>{W.step=3;renderWizard();};
 }
 function step3(box){
-  if(W.form.items.length===0 && !W.packed){ W.form.items.push({boxNo:'',sku:'',nameCn:'',nameEn:'',qty:'',declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:'',boxes:'',boxSpec:''}); }
-  function addRow(){ W.form.items.push({boxNo:'',sku:'',nameCn:'',nameEn:'',qty:1,declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:'',boxes:'',boxSpec:''}); renderWizard(); }
+  if(W.form.items.length===0 && !W.packed){ W.form.items.push({boxLabel:'',boxNo:'',sku:'',nameCn:'',nameEn:'',qty:'',declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:'',boxes:'',boxSpec:''}); }
+  function addRow(){ W.form.items.push({boxLabel:'',boxNo:'',sku:'',nameCn:'',nameEn:'',qty:1,declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:'',boxes:'',boxSpec:''}); renderWizard(); }
   function renderRows(){
     return W.form.items.map((it,i)=>{
       const sk = W.skus.find(s=>s.sku===it.sku);
@@ -528,7 +553,8 @@ function step3(box){
       else if(declareVal!=='' && declareVal!=null){ dcls='cell-manual'; pill='pill-gray'; pillTxt='手填'; }
       else { dcls='cell-warn'; pill='pill-red'; pillTxt='⚠ 待手填'; }
       return `<tr>
-        <td><input data-i="${i}" data-k="boxNo" value="${esc(it.boxNo)}" placeholder="箱号"></td>
+        <td><input data-i="${i}" data-k="boxLabel" value="${esc(it.boxLabel)}" placeholder="箱标" title="模板里的箱号（如 B3）"></td>
+        <td><input data-i="${i}" data-k="boxNo" value="${esc(it.boxNo)}" placeholder="子单号/FBA箱ID" title="FBA 箱子 ID（如 FBA15...U000001）"></td>
         <td><input data-i="${i}" data-k="sku" value="${esc(it.sku)}" list="skuList" placeholder="SKU"></td>
         <td><input data-i="${i}" data-k="nameCn" value="${esc(it.nameCn||(sk?sk.中文品名:'')||(window.SKU_DECLARE&&window.SKU_DECLARE[it.sku]?window.SKU_DECLARE[it.sku].n:''))}" placeholder="中文"></td>
         <td><input data-i="${i}" data-k="nameEn" value="${esc(it.nameEn||(sk?sk.英文品名:''))}" placeholder="英文"></td>
@@ -558,7 +584,7 @@ function step3(box){
     <datalist id="skuList">${W.skus.map(s=>`<option value="${s.sku}">${s.中文品名}</option>`).join('')}</datalist>
     ${ W.handover ? packingBannerHTML() : '' }
     <div style="overflow:auto"><table>
-      <thead><tr><th>箱号</th><th>SKU</th><th>中文</th><th>英文</th><th>数量</th><th>申报价(USD)</th><th>材质</th><th>HS</th><th>品牌</th><th>型号</th><th>箱数</th><th>箱规</th><th>箱重</th><th>长</th><th>宽</th><th>高</th><th>电</th><th>磁</th><th>销售链接</th><th></th></tr></thead>
+      <thead><tr><th>箱标<br><small>(模板箱号)</small></th><th>子单号<br><small>(FBA箱ID)</small></th><th>SKU</th><th>中文</th><th>英文</th><th>数量</th><th>申报价(USD)</th><th>材质</th><th>HS</th><th>品牌</th><th>型号</th><th>箱数</th><th>箱规</th><th>箱重</th><th>长</th><th>宽</th><th>高</th><th>电</th><th>磁</th><th>销售链接</th><th></th></tr></thead>
       <tbody id="rows">${renderRows()}</tbody>
     </table></div>
     <button class="btn secondary" id="addRow" style="margin-top:10px">+ 添加一行</button>
@@ -580,6 +606,7 @@ function step3(box){
       rd.onload=async()=>{
         try{
           let items = isXlsx ? await parsePackingXlsx(rd.result) : parsePackingList(rd.result);
+          items = normalizeItems(items, W.form.fbaNo);
           if(items.length){ W.form.items=items; W.packed=true; msg.textContent='✅ 已上传并填入 '+items.length+' 行（'+file.name+'）。'; renderWizard(); }
           else msg.textContent='⚠️ 解析为空，请确认文件是有效的装箱清单（Excel xlsx 或 CSV）。';
         }catch(err){ console.error(err); msg.textContent='❌ 解析失败：'+(err.message||err); }
@@ -642,7 +669,7 @@ function parsePackingList(text){
   if(lines.length<2) return [];
   const splitCsv=line=> line.split(',').map(s=>s.trim().replace(/^"|"$/g,''));
   const hdr=splitCsv(lines[0]).map(h=>h.toLowerCase());
-  const map={'boxNo':['箱号','箱','carton','boxno','ctn'],'sku':['sku'],'nameCn':['中文品名','品名','名称','namecn'],'nameEn':['英文品名','英文名称','nameen'],'qty':['数量','qty','quantity'],'declare':['申报价','申报价值','declare','price'],'material':['材质','material'],'hs':['hs','海关编码'],'brand':['品牌','brand'],'model':['型号','model'],'boxWeight':['箱重','重量','weight'],'len':['长','length'],'wid':['宽','width'],'hgt':['高','height'],'elec':['带电','elec'],'magnet':['带磁','magnet'],'saleUrl':['销售链接','链接','url','saleurl']};
+  const map={'boxLabel':['箱子名称','箱标签','箱标','boxlabel','label'],'boxNo':['箱号','箱','carton','boxno','ctn'],'sku':['sku'],'nameCn':['中文品名','品名','名称','namecn'],'nameEn':['英文品名','英文名称','nameen'],'qty':['数量','qty','quantity'],'declare':['申报价','申报价值','declare','price'],'material':['材质','material'],'hs':['hs','海关编码'],'brand':['品牌','brand'],'model':['型号','model'],'boxWeight':['箱重','重量','weight'],'len':['长','length'],'wid':['宽','width'],'hgt':['高','height'],'elec':['带电','elec'],'magnet':['带磁','magnet'],'saleUrl':['销售链接','链接','url','saleurl']};
   const idx={};
   for(const f in map){ const i=hdr.findIndex(h=>map[f].some(k=>h.includes(k))); if(i>=0) idx[f]=i; }
   const out=[];
@@ -650,7 +677,7 @@ function parsePackingList(text){
     const c=splitCsv(lines[n]);
     if(c.every(x=>!x)) continue;
     const get=f=> idx[f]>=0 ? c[idx[f]] : '';
-    out.push({boxNo:get('boxNo'),sku:get('sku'),nameCn:get('nameCn'),nameEn:get('nameEn'),qty:get('qty')||1,declare:get('declare'),material:get('material'),hs:get('hs'),brand:get('brand'),model:get('model'),boxWeight:get('boxWeight'),len:get('len'),wid:get('wid'),hgt:get('hgt'),elec:(get('elec')||'N').toUpperCase().startsWith('Y')?'Y':'N',magnet:(get('magnet')||'N').toUpperCase().startsWith('Y')?'Y':'N',saleUrl:get('saleUrl'),cost:''});
+    out.push({boxLabel:get('boxLabel'),boxNo:get('boxNo'),sku:get('sku'),nameCn:get('nameCn'),nameEn:get('nameEn'),qty:get('qty')||1,declare:get('declare'),material:get('material'),hs:get('hs'),brand:get('brand'),model:get('model'),boxWeight:get('boxWeight'),len:get('len'),wid:get('wid'),hgt:get('hgt'),elec:(get('elec')||'N').toUpperCase().startsWith('Y')?'Y':'N',magnet:(get('magnet')||'N').toUpperCase().startsWith('Y')?'Y':'N',saleUrl:get('saleUrl'),cost:''});
   }
   return out;
 }
@@ -712,15 +739,15 @@ function onlineFetch(fid){
         setStep(2,'active');
         setBar(80);
         setTimeout(()=>{
-          W.form.items = pl.map(x=>{
-    W.packed=true;
+          W.form.items = normalizeItems(pl.map(x=>{
+            W.packed=true;
             x = Object.assign({}, x);
             if((!x.declare||x.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[x.sku]){
               x.declare = window.SKU_DECLARE[x.sku].d;
               if(!x.nameCn) x.nameCn = window.SKU_DECLARE[x.sku].n;
             }
             return x;
-          });
+          }), W.form.fbaNo);
           W.packed=true;
           setStep(2,'done');
           setBar(100);
@@ -742,13 +769,13 @@ function onlineFetch(fid){
           if(data.ok && data.items && data.items.length>0){
             setStep(2,'done');
             setBar(100);
-            W.form.items = data.items.map(x=>{
+            W.form.items = normalizeItems(data.items.map(x=>{
               if((!x.declare||x.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[x.sku]){
                 x.declare = window.SKU_DECLARE[x.sku].d;
                 if(!x.nameCn) x.nameCn = window.SKU_DECLARE[x.sku].n;
               }
               return x;
-            });
+            }), W.form.fbaNo);
             W.packed=true;
             renderWizard();
             done(true,'<div class="hint ok" style="margin-top:10px">✅ 已通过后端代理从飞书云文档拉取 <b>'+data.items.length+'</b> 行（货件 '+esc(fid)+'）。请核对品名/数量/申报价。</div>');
@@ -777,15 +804,15 @@ function onlineFetch(fid){
 function loadPackingList(fid){
   const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
   if(pl.length){
-    W.form.items = pl.map(x=>{
-    W.packed=true;
+    W.form.items = normalizeItems(pl.map(x=>{
+      W.packed=true;
       x = Object.assign({}, x);
       if((!x.declare||x.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[x.sku]){
         x.declare = window.SKU_DECLARE[x.sku].d;
         if(!x.nameCn) x.nameCn = window.SKU_DECLARE[x.sku].n;
       }
       return x;
-    });
+    }), W.form.fbaNo);
     renderWizard();
   } else { const m=$('#pl_msg'); if(m) m.textContent='本地未收录该装箱清单，请上传 CSV 或 Excel。'; }
 }
@@ -1005,16 +1032,23 @@ function runChecks(){
   if(missing.length) out.push({level:'err',name:'必填完整性',msg:'以下字段为空：'+missing.join('、')});
   else out.push({level:'ok',name:'必填完整性',msg:'收货人关键字段均已填'});
   let qtySum=0, decSum=0, itemErr=0;
+  const isAnsu = (W.form.物流商==='安速');
+  let hsErr=0, labelErr=0;
   W.form.items.forEach((it,i)=>{
     // 校验时反查 SKU 主数据（与 step3 渲染一致：原始空 → 用 sk.申报价/sk.中文品名）
     const sk = W.skus.find(s=>s.sku===it.sku);
     const effDeclare = (it.declare!==''&&it.declare!=null) ? it.declare : (sk && sk.申报价 ? sk.申报价 : (window.SKU_DECLARE && window.SKU_DECLARE[it.sku] ? window.SKU_DECLARE[it.sku].d : ''));
     const effNameCn = it.nameCn || (sk ? sk.中文品名 : (window.SKU_DECLARE && window.SKU_DECLARE[it.sku] ? window.SKU_DECLARE[it.sku].n : ''));
+    const effHs = it.hs || (sk ? sk.HS : '');
     if(!it.boxNo||!effNameCn||!it.qty||!(effDeclare!==''&&effDeclare!=null)) itemErr++;
+    if(!effHs) hsErr++;
+    if(isAnsu && !it.boxLabel) labelErr++;
     qtySum+=parseFloat(it.qty)||0;
     decSum+=(parseFloat(effDeclare)||0)*(parseFloat(it.qty)||0);
   });
   if(itemErr) out.push({level:'err',name:'物品必填',msg:`有 ${itemErr} 行缺字段。商品申报信息表未收录的 SKU 需手填申报价（详见物品表的红色"待手填"标记），或在飞书「商品申报信息」表补充这些 SKU 的成本价后重烤。`});
+  if(hsErr) out.push({level:'err',name:'HS海关编码缺失',msg:`有 ${hsErr} 行未填 HS 编码。请先在「SKU 主数据」补全这些 SKU 的 HS，或在物品表手填。`});
+  if(labelErr) out.push({level:'err',name:'安速箱标缺失',msg:`有 ${labelErr} 行未填「箱标」（模板里的"箱号"列，如 B3）。若后端只返回了 FBA 箱 ID，请检查来源文件是否包含"箱子名称"列。`});
   else out.push({level:'ok',name:'物品必填',msg:`${W.form.items.length} 行物品均完整`});
   const boxes=[...new Set(W.form.items.map(it=>it.boxNo).filter(Boolean))];
   // qtySum/decSum 挂到该项上,让外层 reduce 能拿到(之前挂在 out 顶层是 bug)
