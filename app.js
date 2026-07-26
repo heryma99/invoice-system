@@ -306,7 +306,7 @@ $$('.nav-btn').forEach(b=> b.onclick=()=>go(b.dataset.view));
 function overview(){
   main().innerHTML = `
   <h2>发票系统骨架架构图 · v1</h2>
-  <div class="sub">七层解耦 · 本地优先 · 质量第一。模板=排版层；值来自 L4 主数据（生成时反查填模板）；导出 Excel=默认交付。</div>
+  <div class="sub">七层解耦 · 云端优先 · 本地兜底 · 质量第一。模板=排版层；值来自 L4 主数据（生成时反查填模板）；导出 Excel=默认交付。</div>
   <div class="grid7">
     ${layer('L1 入口','外部触发','入口A 查飞书单号 / 入口B 用户拖文件 / 手建装箱单','')}
     ${layer('L2 适配','可插拔','飞书表·文件·SP-API·聚水潭（解析防错, fail loud）','')}
@@ -614,8 +614,8 @@ function packingBannerHTML(){
     </div>
     <div class="hint" style="margin-top:10px;font-size:12px;color:#888">
       <b>📤 上传</b>：直接选本机的 xlsx/xls/csv 装箱清单（无需另存为 CSV）。<br>
-      <b>🌐 在线获取</b>：①系统已收录该货件号 → 秒级自动填入；②<b>未收录</b> → <b>点击后会自动调后端从飞书云文档拉取</b>。<br>
-      <span style="color:#c53030">⚠️ 后端未启动？</span> 双击 <code>backend\install_autostart.bat</code> 一次性安装开机自启，<b>之后再也不需要管</b>。
+      <b>🌐 在线获取</b>：①系统已收录该货件号 → 秒级自动填入；②<b>未收录</b> → <b>点击后会自动调云端后端从飞书云文档拉取</b>。<br>
+      <span style="color:#2b6cb0">ℹ️ 云端优先</span>：当前默认连接 Railway 云端后端，无需你电脑开机；若遇「不在FBA表」说明镜像表正在同步，可稍后重试或先上传本机文件。
     </div>
   </div>`;
 }
@@ -755,11 +755,11 @@ function onlineFetch(fid){
           setBar(100);
           let hint = '';
           if(e.name==='TimeoutError' || e.message.includes('timeout')){
-            hint = '<div class="hint warn" style="margin-top:10px">⏱️ 后端15秒超时未响应。<br>① <b>双击 <code>backend\\start_backend.bat</code> 启动本地后端</b>（首次需本机 lark-cli 已授权）；<br>② 或运行 <code>backend\\install_autostart.bat</code> 注册开机自启，<b>之后完全不用管</b>；<br>③ 当前货件可直接点「<b>📤 上传装箱清单</b>」选本机 xlsx。</div>';
+            hint = '<div class="hint warn" style="margin-top:10px">⏱️ 云端后端响应超时（15秒）。<br>① 稍后重试；<br>② 点右上角「后端：已连接」检查是否连上云端；<br>③ 当前货件可直接点「<b>📤 上传装箱清单</b>」选本机 xlsx。</div>';
           } else if(e.message.includes('Failed to fetch')||e.message.includes('fetch')){
-            hint = '<div class="hint warn" style="margin-top:10px">❌ 浏览器连不上本地后端。<br><b>最简单的解决方案：</b>双击 <code>backend\\install_autostart.bat</code> 注册开机自启，<b>之后什么都不用操作</b>，任何时间打开本页面点「在线获取」就秒响应。</div>';
+            hint = '<div class="hint warn" style="margin-top:10px">❌ 浏览器连不上云端后端。<br>① 检查网络；<br>② 点右上角「后端：已连接」切换回本机 localhost:3460 兜底；<br>③ 或直接点「<b>📤 上传装箱清单</b>」选本机文件。</div>';
           } else {
-            hint = '<div class="hint warn" style="margin-top:10px">⚠️ <b>'+esc(fid)+'</b> 后端不可用（'+esc(e.message)+'）。<br>① 双击 <code>backend\\start_backend.bat</code> 启动；<br>② 或点「<b>📤 上传装箱清单</b>」选本机 xlsx（<b>已加强解析支持</b>）。</div>';
+            hint = '<div class="hint warn" style="margin-top:10px">⚠️ <b>'+esc(fid)+'</b> 后端不可用（'+esc(e.message)+'）。<br>① 云端优先模式下可稍后重试；<br>② 点「<b>📤 上传装箱清单</b>」选本机 xlsx（<b>已加强解析支持</b>）。</div>';
           }
           done(false, hint);
         });
