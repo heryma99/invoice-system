@@ -246,7 +246,7 @@ const COEFF = 0.3; // 推算系数: 申报价 = 成本 × 系数(标黄)
 /* ---------- 后端代理状态检测 ---------- */
 async function checkBackend(){
   const el=$('#backendStatus'); if(!el) return;
-  const url = localStorage.getItem('backend_url') || 'https://many-vans-peel.loca.lt';
+  const url = localStorage.getItem('backend_url') || 'http://localhost:3460';
   try{
     const r=await fetch(url+'/api/health', {signal:AbortSignal.timeout(3000)});
     const d=await r.json();
@@ -259,8 +259,8 @@ async function checkBackend(){
   el.title='点击配置后端地址';
 }
 setTimeout(()=>{ checkBackend(); $('#backendStatus').onclick=()=>{
-  const cur=localStorage.getItem('backend_url')||'https://many-vans-peel.loca.lt';
-  const v=prompt('请输入后端代理地址：\n(自动公网隧道, https://xxx.loca.lt = 公网隧道)', cur);
+  const cur=localStorage.getItem('backend_url')||'http://localhost:3460';
+  const v=prompt('请输入后端代理地址：\n默认 http://localhost:3460 即本机常驻后端（推荐，免配置）\n如需远程访问再填公网地址', cur);
   if(v&&v.trim()){ localStorage.setItem('backend_url', v.trim()); checkBackend(); }
 }; }, 500);
 
@@ -709,7 +709,7 @@ function onlineFetch(fid){
         setStep(1,'done');
         setStep(2,'active');
         setBar(60);
-        const backendUrl = localStorage.getItem('backend_url') || 'https://many-vans-peel.loca.lt';
+        const backendUrl = localStorage.getItem('backend_url') || 'http://localhost:3460';
         fetch(backendUrl+'/api/fetch-packing-list', {
           method:'POST',
           headers:{'Content-Type':'application/json'},
