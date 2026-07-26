@@ -216,7 +216,7 @@ async function seedIfEmpty(){
   try { skusSeeded = localStorage.getItem('skus_seeded_ver') === String(SKUS_SEED_VER); } catch(e){}
   if(!skusSeeded){
     await clear('skus');
-    for(const s of (window.SKUS||[])){ await put('skus', s); }
+    for(const s of (window.SKUS||[])){ try{ await put('skus', s.id ? s : {...s, id: s.sku||uid()}); }catch(e){ console.warn('sku 种子跳过', s&&s.sku, e.message); } }
     try { localStorage.setItem('skus_seeded_ver', String(SKUS_SEED_VER)); } catch(e){}
   }
   // 箱型规格主数据：从烘焙的 window.BOX_SPECS(「SKU纸箱规格」飞书表同步) seed
@@ -226,7 +226,7 @@ async function seedIfEmpty(){
   if(!bsSeeded){
     await clear('boxspecs');
     const specs = window.BOX_SPECS || {};
-    for(const b of Object.values(specs)){ await put('boxspecs', b); }
+    for(const b of Object.values(specs)){ try{ await put('boxspecs', {...b, id: b.id||b.sku||uid()}); }catch(e){ console.warn('boxspec 种子跳过', b&&b.sku, e.message); } }
     try { localStorage.setItem('boxspecs_seeded_ver', String(BOXSPEC_SEED_VER)); } catch(e){}
   }
   // 预置 5 家模板（同目录 fetch，仅 http 下可用；file:// 失败则手动上传）
