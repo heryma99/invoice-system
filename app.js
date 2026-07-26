@@ -460,7 +460,7 @@ function showConfirm(r){
 function applyHandover(r){
   const f=W.form; W.handover=r;
   f.fbaNo = r.fba_shipment || r.internal_no;
-  if((r.carrier||r.物流商) && W.channels.some(c=>c.物流商===(r.carrier||r.物流商))) f.物流商=r.carrier||r.物流商;
+  if(r.carrier||r.物流商) f.物流商=r.carrier||r.物流商; // 始终以源表 carrier 为准，避免落到默认渠道
   const sameCarrier = W.channels.filter(c=>c.物流商===f.物流商);
   const byCountry = sameCarrier.find(c=>c.国家 && r.country && c.国家.includes(r.country));
   f.渠道 = (byCountry||sameCarrier[0]||{渠道:f.渠道}).渠道;
@@ -485,7 +485,7 @@ async function lookupWarehouse(){ return (await getAll('warehouses')).find(w=>w.
 async function step2(box){
   const ch=lookupChannel(), wh=await lookupWarehouse();
   const src = W.sources = {
-    shipMethod:{v:ch?ch.渠道:'',src:'channel'}, country:{v:ch?ch.国家:'',src:'channel'}, vat:{v:ch?ch.VAT:'',src:'channel'},
+    shipMethod:{v:ch?ch.渠道:'',src:'channel'}, country:{v:(W.handover&&W.handover.country)||(ch?ch.国家:''),src:(W.handover&&W.handover.country)?'handover':'channel'}, vat:{v:ch?ch.VAT:'',src:'channel'},
     eori:{v:ch?ch.EORI:'',src:'channel'}, vatName:{v:ch?ch.注册名:'',src:'channel'}, vatAddr:{v:ch?ch.注册地址:'',src:'channel'},
     warehouseCode:{v:W.form.仓库代码,src:'manual'}, company:{v:wh?wh.公司:'',src:'warehouse'}, province:{v:wh?wh.省份:'',src:'warehouse'},
     city:{v:wh?wh.城市:'',src:'warehouse'}, address:{v:wh?wh.地址:'',src:'warehouse'}, zip:{v:wh?wh.邮编:'',src:'warehouse'}, phone:{v:wh?wh.电话:'',src:'warehouse'},
