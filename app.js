@@ -242,15 +242,34 @@ async function seedIfEmpty(){
   }
 }
 const COEFF = 0.3; // 推算系数: 申报价 = 成本 × 系数(标黄)
+const RAILWAY_URL = 'https://web-production-6e31e.up.railway.app'; // 云端后端(任何人可用, 不依赖本机开机)
+const LOCAL_URL = 'http://localhost:3460'; // 本机常驻后端(兜底)
 
 /* ---------- 后端代理状态检测 ---------- */
+async function resolveBackend(){
+  // 优先级: 用户手动设置 > 云端Railway(任何人可用) > 本机localhost(兜底)
+  const saved=localStorage.getItem('backend_url');
+  const candidates=[saved, RAILWAY_URL, LOCAL_URL].filter(Boolean);
+  for(const u of candidates){
+    try{
+      const r=await fetch(u+'/api/health', {signal:AbortSignal.timeout(3000)});
+      const d=await r.json();
+      if(d&&d.ok) return u;
+    }catch(_){}
+  }
+  return saved||RAILWAY_URL; // 都连不上则返回首选, 让checkBackend标记未连接
+}
 async function checkBackend(){
   const el=$('#backendStatus'); if(!el) return;
-  const url = localStorage.getItem('backend_url') || 'http://localhost:3460';
+  let url=localStorage.getItem('backend_url')||RAILWAY_URL;
   try{
-    const r=await fetch(url+'/api/health', {signal:AbortSignal.timeout(3000)});
-    const d=await r.json();
-    if(d.ok){ el.textContent='后端: 已连接'; el.style.borderColor='var(--green)'; el.style.color='var(--green)'; }
+    let r=await fetch(url+'/api/health', {signal:AbortSignal.timeout(3000)});
+    let d=await r.json();
+    if(!d||!d.ok){ // 手动设置失效, 自动探测云端/本机
+      const alt=await resolveBackend();
+      if(alt!==url){ url=alt; localStorage.setItem('backend_url', url); r=await fetch(url+'/api/health',{signal:AbortSignal.timeout(3000)}); d=await r.json(); }
+    }
+    if(d&&d.ok){ el.textContent='后端: 已连接 ('+(url.includes('railway')?'云端':'本机')+')'; el.style.borderColor='var(--green)'; el.style.color='var(--green)'; }
     else throw new Error('not ok');
   }catch(e){
     el.textContent='后端: 未连接 (点击配置)'; el.style.borderColor='var(--warn)'; el.style.color='var(--warn)';
@@ -259,8 +278,8 @@ async function checkBackend(){
   el.title='点击配置后端地址';
 }
 setTimeout(()=>{ checkBackend(); $('#backendStatus').onclick=()=>{
-  const cur=localStorage.getItem('backend_url')||'http://localhost:3460';
-  const v=prompt('请输入后端代理地址：\n默认 http://localhost:3460 即本机常驻后端（推荐，免配置）\n如需远程访问再填公网地址', cur);
+  const cur=localStorage.getItem('backend_url')||RAILWAY_URL;
+  const v=prompt('请输入后端代理地址：\n默认云端Railway(任何人可用, 推荐)\n如本机常驻后端则填 http://localhost:3460', cur);
   if(v&&v.trim()){ localStorage.setItem('backend_url', v.trim()); checkBackend(); }
 }; }, 500);
 
@@ -709,7 +728,7 @@ function onlineFetch(fid){
         setStep(1,'done');
         setStep(2,'active');
         setBar(60);
-        const backendUrl = localStorage.getItem('backend_url') || 'http://localhost:3460';
+        const backendUrl = localStorage.getItem('backend_url') || RAILWAY_URL;
         fetch(backendUrl+'/api/fetch-packing-list', {
           method:'POST',
           headers:{'Content-Type':'application/json'},
