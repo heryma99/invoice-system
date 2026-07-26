@@ -669,27 +669,25 @@ function onlineFetch(fid){
 
   /* 阶段推进 */
   function setStep(i,state){
-    const el=$('[data-i="'+i+'"]','#loading_steps');
+    const el=document.querySelector('#loading_steps [data-i="'+i+'"]');
     if(el){ el.className='loading-step '+state; }
   }
   function setBar(pct){
-    const bar=$('#loading_bar');
+    const bar=document.querySelector('#loading_bar');
     if(bar) bar.style.width=pct+'%';
   }
   function done(ok,html){
-    const spinner=$('.spinner','#loading_ui');
-    const title=$('.loading-title','#loading_ui');
+    const ui=document.querySelector('#loading_ui');
+    const spinner=ui&&ui.querySelector('.spinner');
+    const title=ui&&ui.querySelector('.loading-title');
     if(spinner) spinner.style.animation='none';
     if(title){
       title.innerHTML=ok ? '✅ 完成' : '⚠️ 未找到';
       title.style.color=ok ? 'var(--green)' : 'var(--warn)';
     }
-    const wrap=$('#loading_ui');
     /* 2秒后替换成结果信息 */
-    setTimeout(()=>{
-      if(wrap) wrap.outerHTML=html;
-      if(btn) btn.disabled=false;
-    }, ok ? 800 : 2000);
+    if(ui){ setTimeout(()=>{ ui.outerHTML=html; if(btn) btn.disabled=false; }, ok ? 800 : 2000); }
+    else if(btn) btn.disabled=false;
   }
 
   /* 阶段1: 正在搜索（立即激活）*/
