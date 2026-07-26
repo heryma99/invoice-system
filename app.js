@@ -593,14 +593,17 @@ function step3(box){
 function packingBannerHTML(){
   const fid = W.packFbaId || (W.handover&&(W.handover.fba_shipment||W.handover.internal_no)) || '';
   const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
+  const fromCloud = (!pl.length && W.form.items && W.form.items.length>0);
   const fn = W.handover ? W.handover.packing_list : '';
-  if(pl.length){
+  if(pl.length || fromCloud){
+    const n = pl.length || W.form.items.length;
+    const src = pl.length ? (fn||'(FBA箱唛交接表关联)') : '🌐 云端后端拉取（Railway）';
     return `
     <div class="card" style="margin-top:10px;border-color:#2b6cb0">
-      <div class="hint ok">✅ 已从装箱清单自动填入 <b>${pl.length}</b> 行物品（货件 ${esc(fid)}）。请核对品名/数量/申报价，无误即可继续。</div>
+      <div class="hint ok">✅ 已从装箱清单自动填入 <b>${n}</b> 行物品（货件 ${esc(fid)}）。请核对品名/数量/申报价，无误即可继续。</div>
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <button class="btn" id="pl_reload">↻ 重新从装箱清单拉取</button>
-        <span class="muted">源：${esc(fn||'(FBA箱唛交接表关联)')}</span>
+        <span class="muted">源：${esc(src)}</span>
       </div>
     </div>`;
   }
