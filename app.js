@@ -341,7 +341,7 @@ async function wizard(){
   const channels = await getAll('channels');
   const skus = await getAll('skus');
   const templates = (await getAll('templates')).filter(t=>t.状态!=='DISABLED');
-  W = { step:1, channels, skus, boxspecs: await getAll('boxspecs'), templates, mode:'forward', handover:null,
+  W = { step:1, channels, skus, boxspecs: await getAll('boxspecs'), templates, mode:'forward', handover:null, packed:false,
         form:{ 物流商:'安速', 渠道:'美国包税-空派(普货)', 仓库代码:'SCK8', fbaNo:'', amazonRef:'', customs:'否', customInfo:'', items:[] },
         sources:{}, checks:null };
   renderWizard();
@@ -471,8 +471,8 @@ function applyHandover(r){
   const fid = r.fba_shipment || r.internal_no;
   W.packFbaId = fid;
   const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
-  if(pl.length){ W.form.items = pl.map(x=>Object.assign({}, x)); W.plAutoFilled = pl.length; }
-  else { W.plAutoFilled = 0; }
+  if(pl.length){ W.form.items = pl.map(x=>Object.assign({}, x)); W.plAutoFilled = pl.length; W.packed=true; }
+  else { W.plAutoFilled = 0; W.packed=false; }
   W.step=2; renderWizard();
 }
 function warehouseOptions(f){
@@ -513,7 +513,7 @@ async function step2(box){
   $('#next2').onclick=()=>{W.step=3;renderWizard();};
 }
 function step3(box){
-  if(W.form.items.length===0){ W.form.items.push({boxNo:'',sku:'8T026-12',nameCn:'',nameEn:'',qty:8,declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:''}); }
+  if(W.form.items.length===0 && !W.packed){ W.form.items.push({boxNo:'',sku:'',nameCn:'',nameEn:'',qty:'',declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:'',boxes:'',boxSpec:''}); }
   function addRow(){ W.form.items.push({boxNo:'',sku:'',nameCn:'',nameEn:'',qty:1,declare:'',material:'',hs:'',brand:'',model:'',boxWeight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',cost:'',boxes:'',boxSpec:''}); renderWizard(); }
   function renderRows(){
     return W.form.items.map((it,i)=>{
@@ -580,7 +580,7 @@ function step3(box){
       rd.onload=async()=>{
         try{
           let items = isXlsx ? await parsePackingXlsx(rd.result) : parsePackingList(rd.result);
-          if(items.length){ W.form.items=items; msg.textContent='✅ 已上传并填入 '+items.length+' 行（'+file.name+'）。'; renderWizard(); }
+          if(items.length){ W.form.items=items; W.packed=true; msg.textContent='✅ 已上传并填入 '+items.length+' 行（'+file.name+'）。'; renderWizard(); }
           else msg.textContent='⚠️ 解析为空，请确认文件是有效的装箱清单（Excel xlsx 或 CSV）。';
         }catch(err){ console.error(err); msg.textContent='❌ 解析失败：'+(err.message||err); }
       };
@@ -593,7 +593,7 @@ function step3(box){
 function packingBannerHTML(){
   const fid = W.packFbaId || (W.handover&&(W.handover.fba_shipment||W.handover.internal_no)) || '';
   const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
-  const fromCloud = (!pl.length && W.form.items && W.form.items.length>0);
+  const fromCloud = (W.packed && !pl.length);
   const fn = W.handover ? W.handover.packing_list : '';
   if(pl.length || fromCloud){
     const n = pl.length || W.form.items.length;
@@ -626,6 +626,7 @@ function loadPackingList(fid){
   const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
   if(pl.length){
     W.form.items = pl.map(x=>{
+    W.packed=true;
       x = Object.assign({}, x);
       if((!x.declare||x.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[x.sku]){
         x.declare = window.SKU_DECLARE[x.sku].d;
@@ -712,6 +713,7 @@ function onlineFetch(fid){
         setBar(80);
         setTimeout(()=>{
           W.form.items = pl.map(x=>{
+    W.packed=true;
             x = Object.assign({}, x);
             if((!x.declare||x.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[x.sku]){
               x.declare = window.SKU_DECLARE[x.sku].d;
@@ -719,6 +721,7 @@ function onlineFetch(fid){
             }
             return x;
           });
+          W.packed=true;
           setStep(2,'done');
           setBar(100);
           renderWizard();
@@ -746,6 +749,7 @@ function onlineFetch(fid){
               }
               return x;
             });
+            W.packed=true;
             renderWizard();
             done(true,'<div class="hint ok" style="margin-top:10px">✅ 已通过后端代理从飞书云文档拉取 <b>'+data.items.length+'</b> 行（货件 '+esc(fid)+'）。请核对品名/数量/申报价。</div>');
           } else {
@@ -774,6 +778,7 @@ function loadPackingList(fid){
   const pl = (window.PACKING_LISTS && window.PACKING_LISTS[fid]) || [];
   if(pl.length){
     W.form.items = pl.map(x=>{
+    W.packed=true;
       x = Object.assign({}, x);
       if((!x.declare||x.declare==='') && window.SKU_DECLARE && window.SKU_DECLARE[x.sku]){
         x.declare = window.SKU_DECLARE[x.sku].d;
